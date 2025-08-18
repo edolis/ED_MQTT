@@ -1,0 +1,12 @@
+{
+ "name": "ED_MQTT",
+  "version": "1.0.0",
+  "description": "A library to include core mosquitto communication over Wifi",
+  "keywords": ["MQTT", "WiFi", "ESP32"],
+  "frameworks": ["espidf"],
+  "platforms": ["espressif32"],
+  "build": {
+    "srcFilter": "+<*>"
+  }
+}
+
