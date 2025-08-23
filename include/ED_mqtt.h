@@ -57,6 +57,9 @@ enum { ED_MQTT_SENSOR_EVENT_DATA_READY, ED_MQTT_SENSOR_EVENT_ERROR };
 
 // MqttClient.h
 
+extern const char* mqtt_event_names[] ;
+
+
 class MqttClient {
 private:
   static std::unique_ptr<MqttClient> makeInstance();
