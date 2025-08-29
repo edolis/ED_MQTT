@@ -14,7 +14,13 @@ and loaded in the firmware by adding to the platformio.ini
  board_build.embed_txtfiles = certs/ca.crt
  *
 
- NOTE ON ENVIRONMENT SETUP.
+ ANNOTATION ON ENVIRONMENT SETUP.
+ Two options - use the predefined template  ED_templ_ESP
+
+ OR
+
+ configure manually as specidfied below:
+
  To include a ca.crt
  a) you need to add to the platformio environment configuration
 board_build.embed_txtfiles = src/certs/ca.crt
@@ -62,17 +68,22 @@ extern const char* mqtt_event_names[] ;
 
 class MqttClient {
 private:
-  static std::unique_ptr<MqttClient> makeInstance();
+bool eventsRegistered=false;
+//single instance. Notice! derived class must redeclare to store thier single instance and hide the base one.
+  static inline std::unique_ptr<MqttClient> _instance=nullptr;
 
 public:
   /**
-   * @brief Factory method to create an instance of MqttClient
-   * the class implements a basic set of event handling suited to the MQTT communication ESP-Broker
-   * It is meant to be a singleton.
+   * @brief initializes a singleton which creates and manages a single
+   * MQTT connection and implement core
+   * handling capabilities. handling can be expanded in derived classes
    * @param config the configuration for the broker
-   * @return std::unique_ptr<MqttClient> the pointer to the singleton instance of the class
    */
-  static std::unique_ptr<MqttClient> create(esp_mqtt_client_config_t config);
+  static esp_err_t create(esp_mqtt_client_config_t config);
+
+  static MqttClient* getInstance() {
+    return _instance.get();
+  };
 
   /// Mosquitto: quality of service
   class MqttQoS {
@@ -85,25 +96,31 @@ public:
   };
   virtual ~MqttClient() {}
 
+  private:
+  /// @brief trampoline function which dispatched the static callback of the base class to the instance callback of the most derived class
+  static void mqtt_event_trampoline(void *handler_args,
+                                  esp_event_base_t base,
+                                  int32_t event_id,
+                                  void *event_data);
+
+
   protected:
   /**
-   * @brief launches the broker. this method
-   *
+   * @brief registers the event callback and launches the broker.
    * @param config
    * @return esp_err_t
    */
-  esp_err_t start(esp_mqtt_client_config_t config);
+   esp_err_t start(esp_mqtt_client_config_t config);
   // Public method to register the handler.
   // Derived classes can call this to link their instance to the event loop.
-  void registerHandler(esp_mqtt_client_handle_t client);
-  esp_mqtt_client_handle_t client =
-      nullptr; // not static as multiple derived classes might be used
+  // void registerHandler(esp_mqtt_client_handle_t client);
+  esp_mqtt_client_handle_t client =       nullptr; // not static as multiple derived classes might be used
                // simultaneously
 
   // This is the private static member function that acts as the C callback.
   // It's static to remove the implicit 'this' pointer.
-  static void handleEventCallback(void *handler_args, esp_event_base_t base,
-                                  int32_t event_id, void *event_data);
+  // static void handleEventCallback(void *handler_args, esp_event_base_t base,
+  //                                 int32_t event_id, void *event_data);
   /**
    * @brief provides a base implementation for the core MQTT events.
    * Derived classes can extend or partially override by processing selected
@@ -117,12 +134,27 @@ public:
                            void *event_data);
 };
 
-class MyMqttClient : public MqttClient {
-public:
-  static std::unique_ptr<MyMqttClient>
-  create(const esp_mqtt_client_config_t &config);
-  void send_ping_message(); //TODO temporary for testing - implement as bound to connect event launching timer led ping with reported info on the status of the ESP
+/**
+ * @brief example of derived class.
+ * derived class basically overrides handler to handle additional events
+ * which can be custom defined extending the
+ *
+ */
 
+class SAMPLE_derivedMqttClient : public MqttClient {
+  private:
+bool eventsRegistered=false;
+
+//single instance. Notice! derived class must redeclare to store thier single instance and hide the base one.
+  static inline std::unique_ptr<SAMPLE_derivedMqttClient> _instance=nullptr; //REQUIRED TO SHADOW BASE
+
+public:
+  static esp_err_t create(esp_mqtt_client_config_t config);//REQUIRED TO SHADOW BASE
+   void send_ping_message(); //TODO temporary for testing - implement as bound to connect event launching timer led ping with reported info on the status of the ESP
+
+  static SAMPLE_derivedMqttClient* getInstance() {
+    return _instance.get();
+  };
 protected:
   // This is the implementation of the pure virtual function from the base
   // class. You can't make this private because it needs to be accessible to the
