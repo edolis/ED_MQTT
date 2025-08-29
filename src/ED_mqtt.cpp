@@ -1,8 +1,9 @@
 #include "ED_mqtt.h"
+#include "esp_event_base.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <iostream>
-#include "esp_event_base.h"
+
 namespace ED_MQTT {
 
 static const char *TAG = "ED_MQTT";
@@ -138,46 +139,62 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
 
 void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                              void *event_data) {
-    auto *event = static_cast<esp_mqtt_event_t *>(event_data);
-//note. base will always be the same value, the MQQT_EVENT or so- not clear about the value, but it's a dead parameter here
+  auto *event = static_cast<esp_mqtt_event_t *>(event_data);
+  // note. base will always be the same value, the MQQT_EVENT or so- not clear
+  // about the value, but it's a dead parameter here
 
-    switch (event_id) {
-    case MQTT_EVENT_CONNECTED:
-      ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-      esp_mqtt_client_subscribe(client, "/test/topic",
-                                0); // TODO implement connection standard
-      esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
-                              MqttQoS::QOS1, 0);
-      break;
-    case MQTT_EVENT_DISCONNECTED:
-      ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
-      break;
-    case MQTT_EVENT_ERROR:
-      ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
-      break;
-    case MQTT_EVENT_DATA:
-      ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-      ESP_LOGI(TAG, "data received with TOPIC=%s  DATA=%s", event->topic,
-               event->data);
-      break;
-    default:
-      ESP_LOGI(TAG, "MQTT event id:%s", mqtt_event_names[event->event_id]);
-      break;
-    }
+  switch (event_id) {
+  case MQTT_EVENT_CONNECTED:
+    ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+    esp_mqtt_client_subscribe(client, "/test/topic",
+                              0); // TODO implement connection standard
+    esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
+                            MqttQoS::QOS1, 0);
+    break;
+  case MQTT_EVENT_DISCONNECTED:
+    ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
+    break;
+  case MQTT_EVENT_ERROR:
+    ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
+    break;
+  case MQTT_EVENT_DATA:
+    ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+    ESP_LOGI(TAG, "data received with TOPIC=%s  DATA=%s", event->topic,
+             event->data);
+    break;
+  default:
+    ESP_LOGI(TAG, "MQTT event id:%s", mqtt_event_names[event->event_id]);
+    break;
+  }
 }
 
- 
+MqttClient::~MqttClient() {
 
-    /**
-     * periodic state transmission
-     * to be transmitted at connection and periodically
-     *
-     * a) device hostname
-     * b) device MAC (used as key in database ops)
-     * c) Wifi conn data (current + available APs, signal strength)
-     * d) firmware version
-     *
-     */
+  // Unregister event handlers
+  if (eventsRegistered && client != nullptr) {
+    esp_mqtt_client_unregister_event(client, MQTT_EVENT_ANY,
+                                     mqtt_event_trampoline);
+    eventsRegistered = false;
+  }
+
+  // Destroy MQTT client
+  if (client != nullptr) {
+    esp_mqtt_client_stop(client);
+    esp_mqtt_client_destroy(client);
+    client = nullptr;
+  }
+}
+
+/**
+ * periodic state transmission
+ * to be transmitted at connection and periodically
+ *
+ * a) device hostname
+ * b) device MAC (used as key in database ops)
+ * c) Wifi conn data (current + available APs, signal strength)
+ * d) firmware version
+ *
+ */
 
 /**
  * note! create initializes the only instance of the class and saves in the
@@ -204,32 +221,33 @@ void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
                                            int32_t event_id, void *event_data) {
 
   // these override the default event handler of the base class
-    auto *event = static_cast<esp_mqtt_event_t *>(event_data);
-    switch (event_id) {
-    case MQTT_EVENT_CONNECTED:
-      ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-      esp_mqtt_client_subscribe(client, "/test/topic", 0);
-      esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
-                              MqttQoS::QOS1, 0);
-      break;
-    case MQTT_EVENT_DISCONNECTED:
-      ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
-      break;
-    case MQTT_EVENT_ERROR:
-      ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
-      break;
-    case MQTT_USER_EVENT:
-      ESP_LOGE(TAG, "MQTT_USER EVENT"); //this is the place where discriminate payload
-      break;
-    case MQTT_EVENT_DATA:
-      ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-      printf("TOPIC=%.*s\n", event->topic_len, event->topic);
-      printf("DATA=%.*s\n", event->data_len, event->data);
-      break;
-    default:
-      MqttClient::handleEvent(base, event_id, event_data);
-      break;
-      };
+  auto *event = static_cast<esp_mqtt_event_t *>(event_data);
+  switch (event_id) {
+  case MQTT_EVENT_CONNECTED:
+    ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+    esp_mqtt_client_subscribe(client, "/test/topic", 0);
+    esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
+                            MqttQoS::QOS1, 0);
+    break;
+  case MQTT_EVENT_DISCONNECTED:
+    ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
+    break;
+  case MQTT_EVENT_ERROR:
+    ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
+    break;
+  case MQTT_USER_EVENT:
+    ESP_LOGE(TAG,
+             "MQTT_USER EVENT"); // this is the place where discriminate payload
+    break;
+  case MQTT_EVENT_DATA:
+    ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+    printf("TOPIC=%.*s\n", event->topic_len, event->topic);
+    printf("DATA=%.*s\n", event->data_len, event->data);
+    break;
+  default:
+    MqttClient::handleEvent(base, event_id, event_data);
+    break;
+  };
 };
 
 void SAMPLE_derivedMqttClient::send_ping_message() {
