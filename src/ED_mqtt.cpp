@@ -1,5 +1,7 @@
 #include "ED_mqtt.h"
+#include "ED_sysstd.h"
 #include "esp_event_base.h"
+#include "secrets.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <iostream>
@@ -77,6 +79,107 @@ const char *mqtt_event_names[] = {
 };
 
 ESP_EVENT_DEFINE_BASE(ED_MQTT_SENSOR_EVENTS);
+/*
+const esp_mqtt_client_config_t MqttClient::mqtt_default_cfg = {
+
+    .broker =
+        {
+            .address =
+                {
+                    .uri = ED_MQTT_URI,
+
+                    //.hostname = "raspi00",
+                },
+            .verification =
+                {
+                    .use_global_ca_store = false,
+                    // .certificate = cert.c_str(),
+                    // .certificate_len = cert.length(),
+                    .certificate = reinterpret_cast<const char *>(ca_crt_start),
+                    .certificate_len =
+                        // static_cast<size_t>(ca_crt_end - ca_crt_start),
+                    static_cast<size_t>(
+                        reinterpret_cast<uintptr_t>(ca_crt_end) -
+                        reinterpret_cast<uintptr_t>(ca_crt_start)), // to
+                    //  avoid warning in code analysis, conversion to ram
+                    //  memory pointers.
+
+                    .skip_cert_common_name_check = false,
+                },
+        },
+    .credentials =
+        {
+            .username = ED_MQTT_USERNAME,
+            .client_id = ED_sysstd::ESP_std::mqttName(),
+            .authentication =
+                {
+                    .password = ED_MQTT_PASSWORD,
+                },
+        },
+    .session = {.last_will{
+        .topic = ("devices/connection/" +
+                  std::string(ED_sysstd::ESP_std::mqttName()))
+                     .c_str(),
+        .msg = (std::string(ED_sysstd::ESP_std::mqttName()) +
+                " disconnected unexpectedlty.")
+                   .c_str(),
+        .qos = MqttQoS::QOS1,
+        .retain = true,
+    }},
+};
+*/
+
+void MqttClient::setDefaultConfig() {
+  /**
+   * @brief note! required as defining it const creates crashes as there is no
+   * guarantee the ED_sysstd are initialized before at boot this will guarantee
+   * initialization takes place after app start
+   *
+   */
+  static std::string topicStr =
+      "devices/connection/" + std::string(ED_sysstd::ESP_std::mqttName());
+  static std::string msgStr = std::string(ED_sysstd::ESP_std::mqttName()) +
+                              " disconnected unexpectedly.";
+  esp_mqtt_client_config_t cfg = {
+      .broker =
+          {
+              .address =
+                  {
+                      .uri = ED_MQTT_URI,
+                  },
+              .verification =
+                  {
+                      .use_global_ca_store = false,
+                      .certificate =
+                          reinterpret_cast<const char *>(ca_crt_start),
+                      .certificate_len = static_cast<size_t>(
+                          reinterpret_cast<uintptr_t>(ca_crt_end) -
+                          reinterpret_cast<uintptr_t>(ca_crt_start)),
+                      .skip_cert_common_name_check = false,
+                  },
+          },
+      .credentials =
+          {
+              .username = ED_MQTT_USERNAME,
+              .client_id = ED_sysstd::ESP_std::mqttName(),
+              .authentication =
+                  {
+                      .password = ED_MQTT_PASSWORD,
+                  },
+          },
+      .session =
+          {
+              .last_will =
+                  {
+                      .topic = topicStr.c_str(),
+                      .msg = msgStr.c_str(),
+                      .qos = MqttQoS::QOS1,
+                      .retain = true,
+                  },
+          },
+  };
+  mqttConfig = cfg;
+}
 
 // MqttClient.cpp
 /**
@@ -84,16 +187,43 @@ ESP_EVENT_DEFINE_BASE(ED_MQTT_SENSOR_EVENTS);
  * static _instance Must be redeclared in derived class to use the static
  * _instance variable of the derived class
  */
-esp_err_t MqttClient::create(esp_mqtt_client_config_t config) {
-  // TODO set clientID, improve handling of config
-  auto instance = std::make_unique<MqttClient>();
-  esp_err_t err = instance->start(config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(err));
-    return err;
+MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
+  if (_instance == nullptr) { //avoid retrying to initialize when already done
+    if (config != nullptr) {
+      mqttConfig = *config;
+    } else
+      setDefaultConfig();
+    auto instance = std::make_unique<MqttClient>();
+    esp_err_t err = instance->start(mqttConfig);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to start MQTT client: %s", esp_err_to_name(err));
+      return nullptr;
+    }
+    _instance = move(instance);
   }
-  _instance = move(instance);
-  return ESP_OK;
+  else{
+    // if( configuration equals)
+    /*
+    bool areConfigsEqual(const esp_mqtt_client_config_t& cfg1, const esp_mqtt_client_config_t& cfg2) {
+    if (strcmp(cfg1.broker.address.uri, cfg2.broker.address.uri) != 0) return false;
+    if (cfg1.broker.verification.use_global_ca_store != cfg2.broker.verification.use_global_ca_store) return false;
+    if (cfg1.broker.verification.certificate_len != cfg2.broker.verification.certificate_len) return false;
+    if (memcmp(cfg1.broker.verification.certificate, cfg2.broker.verification.certificate, cfg1.broker.verification.certificate_len) != 0) return false;
+    if (strcmp(cfg1.credentials.username, cfg2.credentials.username) != 0) return false;
+    if (strcmp(cfg1.credentials.client_id, cfg2.credentials.client_id) != 0) return false;
+    if (strcmp(cfg1.credentials.authentication.password, cfg2.credentials.authentication.password) != 0) return false;
+    if (strcmp(cfg1.session.last_will.topic, cfg2.session.last_will.topic) != 0) return false;
+    if (strcmp(cfg1.session.last_will.msg, cfg2.session.last_will.msg) != 0) return false;
+    if (cfg1.session.last_will.qos != cfg2.session.last_will.qos) return false;
+    if (cfg1.session.last_will.retain != cfg2.session.last_will.retain) return false;
+
+    return true;
+}
+
+*/
+    //TODO implement reconnection with different config
+  }
+  return _instance.get();
 }
 
 // static trampoline callback method to redirect to the instance override-able
@@ -146,10 +276,17 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
   switch (event_id) {
   case MQTT_EVENT_CONNECTED:
     ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-    esp_mqtt_client_subscribe(client, "/test/topic",
-                              0); // TODO implement connection standard
+    // manages must haqve subscriptions. the remaining ones required by external
+    // classes can be activated using the connected_callbacks
+    esp_mqtt_client_subscribe(client, "devices/connection", 0);
+#ifdef DEBUG_BUILD
     esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
                             MqttQoS::QOS1, 0);
+#endif
+    // Iterate and call all registered subscriber functions
+    for (const auto &callback : connected_callbacks) {
+      callback(event->client);
+    }
     break;
   case MQTT_EVENT_DISCONNECTED:
     ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");

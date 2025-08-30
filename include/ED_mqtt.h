@@ -2,6 +2,7 @@
 #include <esp_event_base.h>
 #include <memory>
 #include <mqtt_client.h>
+#include <functional>
 
 namespace ED_MQTT {
 
@@ -62,28 +63,46 @@ ESP_EVENT_DECLARE_BASE(ED_MQTT_SENSOR_EVENTS);
 enum { ED_MQTT_SENSOR_EVENT_DATA_READY, ED_MQTT_SENSOR_EVENT_ERROR };
 
 // MqttClient.h
+// Embedded CA certificate
+extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
+extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
 
 extern const char* mqtt_event_names[] ;
-
+/// callback function type to allow subscribers perform action at mqtt connection
+using MqttConnectedCallback = std::function<void(esp_mqtt_client_handle_t)>;
 
 class MqttClient {
 private:
+static void setDefaultConfig();
+static inline std::vector<MqttConnectedCallback> connected_callbacks;
 bool eventsRegistered=false;
 //single instance. Notice! derived class must redeclare to store thier single instance and hide the base one.
   static inline std::unique_ptr<MqttClient> _instance=nullptr;
-
+/// @brief default configuration for the connection to the mosquitto broker
+static const   esp_mqtt_client_config_t mqtt_default_cfg ;
 public:
-  /**
-   * @brief initializes a singleton which creates and manages a single
-   * MQTT connection and implement core
-   * handling capabilities. handling can be expanded in derived classes
-   * @param config the configuration for the broker
-   */
-  static esp_err_t create(esp_mqtt_client_config_t config);
+void registerConnectedCallback(MqttConnectedCallback callback) {
+        connected_callbacks.push_back(callback);
+    }
+    /**
+     * @brief initializes a singleton which creates and manages a single
+     * MQTT connection and implement core
+     * handling capabilities. handling can be expanded in derived classes
+     * @param config the configuration for the broker
+     * @return MqttClient* pointer to the singleton instance
+     */
+    static MqttClient *create(esp_mqtt_client_config_t *config = nullptr);
+    /**
+     * @brief сreates the Mosquitto client with the standard configuration
+     *
+     * @return MqttClient* pointer to the singleton instance
+     */
+    // static MqttClient* create();
 
-  static MqttClient* getInstance() {
-    return _instance.get();
-  };
+    static MqttClient *getInstance()
+    {
+        return _instance.get();
+    };
 
   /// Mosquitto: quality of service
   class MqttQoS {
@@ -94,9 +113,12 @@ public:
       QOS2 = 2  // Exactly once
     };
   };
-  virtual ~MqttClient() {}
+  virtual ~MqttClient() ;
 
   private:
+
+  static inline esp_mqtt_client_config_t mqttConfig={}; //internal copy of the current mqtt configuration
+
   /// @brief trampoline function which dispatched the static callback of the base class to the instance callback of the most derived class
   static void mqtt_event_trampoline(void *handler_args,
                                   esp_event_base_t base,
