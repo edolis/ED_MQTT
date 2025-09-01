@@ -18,8 +18,8 @@
     .flash.text     737 184    .dram0.bss   20 320
     .flash.appdesc      256    ―――――――――――――――――――
     .flash.rodata   128 484    total        32 100
-    ―――――――――――――――――――――――                       
-    subtotal        951 138                       
+    ―――――――――――――――――――――――
+    subtotal        951 138
 
     @compiledSizeInfo end
  * @date 2025-08-29
@@ -43,7 +43,7 @@ struct GIT_fwInfo {
 
 
 #include "ED_esp_err.h"
-#include "ED_mqtt.h"
+#include "ED_mqtt_CRTP.h"
 #include "ED_sysInfo.h"
 #include "ED_wifi.h"
 
@@ -116,7 +116,7 @@ extern "C" void app_main(void) {
           },
   };
   // Initialize MQTT client
-  SAMPLE_derivedMqttClient* MQTTclient;
+  SAMPLE_derivedMqttClient_CRTP* MQTTclient;
 
   // Subscribe to IP ready event
   WiFiService::subscribeToIPReady([&mqtt_cfg, &MQTTclient]() {
@@ -127,8 +127,8 @@ extern "C" void app_main(void) {
     // ESP_LOGI(TAG, "CERTPOINTER r: %p, len: %d",
     //          mqtt_cfg.broker.verification.certificate,
     //          mqtt_cfg.broker.verification.certificate_len);
-    SAMPLE_derivedMqttClient::create(mqtt_cfg);
-     MQTTclient = SAMPLE_derivedMqttClient::getInstance();
+    SAMPLE_derivedMqttClient_CRTP::create(mqtt_cfg);
+     MQTTclient = SAMPLE_derivedMqttClient_CRTP::getInstance();
   });
 
   while (true) {

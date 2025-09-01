@@ -140,7 +140,9 @@ void MqttClient::setDefaultConfig() {
       "devices/connection/" + std::string(ED_sysstd::ESP_std::mqttName());
   static std::string msgStr = std::string(ED_sysstd::ESP_std::mqttName()) +
                               " disconnected unexpectedly.";
-  esp_mqtt_client_config_t cfg = {
+
+  esp_mqtt_client_config_t cfg = {};
+  cfg = {
       .broker =
           {
               .address =
@@ -165,6 +167,7 @@ void MqttClient::setDefaultConfig() {
               .authentication =
                   {
                       .password = ED_MQTT_PASSWORD,
+                      .use_secure_element=false,
                   },
           },
       .session =
@@ -188,7 +191,7 @@ void MqttClient::setDefaultConfig() {
  * _instance variable of the derived class
  */
 MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
-  if (_instance == nullptr) { //avoid retrying to initialize when already done
+  if (_instance == nullptr) { // avoid retrying to initialize when already done
     if (config != nullptr) {
       mqttConfig = *config;
     } else
@@ -200,32 +203,43 @@ MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
       return nullptr;
     }
     _instance = move(instance);
-  }
-  else{
+  } else {
     // if( configuration equals)
     /*
-    bool areConfigsEqual(const esp_mqtt_client_config_t& cfg1, const esp_mqtt_client_config_t& cfg2) {
-    if (strcmp(cfg1.broker.address.uri, cfg2.broker.address.uri) != 0) return false;
-    if (cfg1.broker.verification.use_global_ca_store != cfg2.broker.verification.use_global_ca_store) return false;
-    if (cfg1.broker.verification.certificate_len != cfg2.broker.verification.certificate_len) return false;
-    if (memcmp(cfg1.broker.verification.certificate, cfg2.broker.verification.certificate, cfg1.broker.verification.certificate_len) != 0) return false;
-    if (strcmp(cfg1.credentials.username, cfg2.credentials.username) != 0) return false;
-    if (strcmp(cfg1.credentials.client_id, cfg2.credentials.client_id) != 0) return false;
-    if (strcmp(cfg1.credentials.authentication.password, cfg2.credentials.authentication.password) != 0) return false;
-    if (strcmp(cfg1.session.last_will.topic, cfg2.session.last_will.topic) != 0) return false;
-    if (strcmp(cfg1.session.last_will.msg, cfg2.session.last_will.msg) != 0) return false;
-    if (cfg1.session.last_will.qos != cfg2.session.last_will.qos) return false;
-    if (cfg1.session.last_will.retain != cfg2.session.last_will.retain) return false;
+    bool areConfigsEqual(const esp_mqtt_client_config_t& cfg1, const
+esp_mqtt_client_config_t& cfg2) { if (strcmp(cfg1.broker.address.uri,
+cfg2.broker.address.uri) != 0) return false; if
+(cfg1.broker.verification.use_global_ca_store !=
+cfg2.broker.verification.use_global_ca_store) return false; if
+(cfg1.broker.verification.certificate_len !=
+cfg2.broker.verification.certificate_len) return false; if
+(memcmp(cfg1.broker.verification.certificate,
+cfg2.broker.verification.certificate, cfg1.broker.verification.certificate_len)
+!= 0) return false; if (strcmp(cfg1.credentials.username,
+cfg2.credentials.username) != 0) return false; if
+(strcmp(cfg1.credentials.client_id, cfg2.credentials.client_id) != 0) return
+false; if (strcmp(cfg1.credentials.authentication.password,
+cfg2.credentials.authentication.password) != 0) return false; if
+(strcmp(cfg1.session.last_will.topic, cfg2.session.last_will.topic) != 0) return
+false; if (strcmp(cfg1.session.last_will.msg, cfg2.session.last_will.msg) != 0)
+return false; if (cfg1.session.last_will.qos != cfg2.session.last_will.qos)
+return false; if (cfg1.session.last_will.retain !=
+cfg2.session.last_will.retain) return false;
 
     return true;
 }
 
 */
-    //TODO implement reconnection with different config
+    // TODO implement reconnection with different config
   }
   return _instance.get();
 }
 
+esp_mqtt_client_handle_t MqttClient::getHandle() {
+  // ESP_LOGI(TAG, "in gethandle, client: %s ",
+  //          (client == nullptr) ? "nullptr" : "OK");
+  return client;
+};
 // static trampoline callback method to redirect to the instance override-able
 // handler
 void MqttClient::mqtt_event_trampoline(void *handler_args,
@@ -295,10 +309,36 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
     ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
     break;
   case MQTT_EVENT_DATA:
+#ifdef DEBUG_BUILD
+
     ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-    ESP_LOGI(TAG, "data received with TOPIC=%s  DATA=%s", event->topic,
-             event->data);
-    break;
+#endif
+    static std::string partialPayload;
+    // Append chunk to buffer
+    partialPayload.append(event->data, event->data_len);
+
+    if (event->total_data_len == event->data_len + event->current_data_offset) {
+      // Last chunk received
+      ESP_LOGI(TAG, "Full message received:");
+      // for (size_t i = 0; i < data.length(); ++i) {
+      //   printf("[%02X] ", static_cast<unsigned char>(data[i]));
+      // }
+      // printf("\n");
+      ESP_LOGI(TAG, "Raw payload: [%.*s]", partialPayload.length(), partialPayload.c_str());
+      ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+      ESP_LOGI(TAG, "DATA=%s", partialPayload.c_str());
+
+      // Process full message
+      // processMessage(event->topic, partialPayload);
+
+      for (const auto &callback : data_callbacks) {
+   callback(event->client, std::string(event->topic, event->topic_len), partialPayload);
+
+      }
+
+      // Clear buffer
+      partialPayload.clear();
+    }
   default:
     ESP_LOGI(TAG, "MQTT event id:%s", mqtt_event_names[event->event_id]);
     break;
@@ -378,9 +418,25 @@ void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
     break;
   case MQTT_EVENT_DATA:
     ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-    printf("TOPIC=%.*s\n", event->topic_len, event->topic);
-    printf("DATA=%.*s\n", event->data_len, event->data);
+    static std::string partialPayload;
+    // Append chunk to buffer
+    partialPayload.append(event->data, event->data_len);
+
+    if (event->total_data_len == event->data_len + event->current_data_offset) {
+      // Last chunk received
+      ESP_LOGI(TAG, "Full message received:");
+      ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+      ESP_LOGI(TAG, "DATA=%s", partialPayload.c_str());
+
+      // Process full message
+      // processMessage(event->topic, partialPayload);
+      ESP_LOGI(TAG, "TOPIC=%s  DATA=%s\n", event->topic,
+               partialPayload.c_str());
+      // Clear buffer
+      partialPayload.clear();
+    }
     break;
+
   default:
     MqttClient::handleEvent(base, event_id, event_data);
     break;

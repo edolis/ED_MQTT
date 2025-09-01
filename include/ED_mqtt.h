@@ -1,8 +1,8 @@
 #pragma once
 #include <esp_event_base.h>
+#include <functional>
 #include <memory>
 #include <mqtt_client.h>
-#include <functional>
 
 namespace ED_MQTT {
 
@@ -67,76 +67,82 @@ enum { ED_MQTT_SENSOR_EVENT_DATA_READY, ED_MQTT_SENSOR_EVENT_ERROR };
 extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
 extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
 
-extern const char* mqtt_event_names[] ;
-/// callback function type to allow subscribers perform action at mqtt connection
+extern const char *mqtt_event_names[];
+/// callback function type to allow subscribers perform action at mqtt
+/// connection
 using MqttConnectedCallback = std::function<void(esp_mqtt_client_handle_t)>;
+using MqttDataCallback = std::function<void(esp_mqtt_client_handle_t,std::string,std::string)>;
 
 class MqttClient {
 private:
-static void setDefaultConfig();
-static inline std::vector<MqttConnectedCallback> connected_callbacks;
-bool eventsRegistered=false;
-//single instance. Notice! derived class must redeclare to store thier single instance and hide the base one.
-  static inline std::unique_ptr<MqttClient> _instance=nullptr;
-/// @brief default configuration for the connection to the mosquitto broker
-static const   esp_mqtt_client_config_t mqtt_default_cfg ;
-public:
-void registerConnectedCallback(MqttConnectedCallback callback) {
-        connected_callbacks.push_back(callback);
-    }
-    /**
-     * @brief initializes a singleton which creates and manages a single
-     * MQTT connection and implement core
-     * handling capabilities. handling can be expanded in derived classes
-     * @param config the configuration for the broker
-     * @return MqttClient* pointer to the singleton instance
-     */
-    static MqttClient *create(esp_mqtt_client_config_t *config = nullptr);
-    /**
-     * @brief сreates the Mosquitto client with the standard configuration
-     *
-     * @return MqttClient* pointer to the singleton instance
-     */
-    // static MqttClient* create();
+  static void setDefaultConfig();
+  static inline std::vector<MqttConnectedCallback> connected_callbacks;
+  static inline std::vector<MqttDataCallback> data_callbacks;
+  bool eventsRegistered = false;
+  // single instance. Notice! derived class must redeclare to store thier single
+  // instance and hide the base one.
+  static inline std::unique_ptr<MqttClient> _instance = nullptr;
+  /// @brief default configuration for the connection to the mosquitto broker
+  static const esp_mqtt_client_config_t mqtt_default_cfg;
 
-    static MqttClient *getInstance()
-    {
-        return _instance.get();
-    };
+public:
+  void registerConnectedCallback(MqttConnectedCallback callback) {
+    connected_callbacks.push_back(callback);
+  };
+  void registerDataCallback(MqttDataCallback callback) {
+    data_callbacks.push_back(callback);
+  };
+  // returns the handle of the mosquitto connection of the current instance
+   esp_mqtt_client_handle_t getHandle() ;
+  /**
+   * @brief initializes a singleton which creates and manages a single
+   * MQTT connection and implement core
+   * handling capabilities. handling can be expanded in derived classes
+   * @param config the configuration for the broker
+   * @return MqttClient* pointer to the singleton instance
+   */
+  static MqttClient *create(esp_mqtt_client_config_t *config = nullptr);
+  /**
+   * @brief сreates the Mosquitto client with the standard configuration
+   *
+   * @return MqttClient* pointer to the singleton instance
+   */
+  // static MqttClient* create();
+
+  static MqttClient *getInstance() { return _instance.get(); };
 
   /// Mosquitto: quality of service
   class MqttQoS {
-    public:
+  public:
     enum Value : int {
       QOS0 = 0, // At most once
       QOS1 = 1, // At least once
       QOS2 = 2  // Exactly once
     };
   };
-  virtual ~MqttClient() ;
+  virtual ~MqttClient();
 
-  private:
+private:
+  static inline esp_mqtt_client_config_t mqttConfig =
+      {}; // internal copy of the current mqtt configuration
 
-  static inline esp_mqtt_client_config_t mqttConfig={}; //internal copy of the current mqtt configuration
+  /// @brief trampoline function which dispatched the static callback of the
+  /// base class to the instance callback of the most derived class
+  static void mqtt_event_trampoline(void *handler_args, esp_event_base_t base,
+                                    int32_t event_id, void *event_data);
 
-  /// @brief trampoline function which dispatched the static callback of the base class to the instance callback of the most derived class
-  static void mqtt_event_trampoline(void *handler_args,
-                                  esp_event_base_t base,
-                                  int32_t event_id,
-                                  void *event_data);
-
-
-  protected:
+protected:
   /**
    * @brief registers the event callback and launches the broker.
    * @param config
    * @return esp_err_t
    */
-   esp_err_t start(esp_mqtt_client_config_t config);
+  esp_err_t start(esp_mqtt_client_config_t config);
   // Public method to register the handler.
   // Derived classes can call this to link their instance to the event loop.
   // void registerHandler(esp_mqtt_client_handle_t client);
-  esp_mqtt_client_handle_t client =       nullptr; // not static as multiple derived classes might be used
+  esp_mqtt_client_handle_t client =
+      nullptr; // not static as multiple derived classes might be used
                // simultaneously
 
   // This is the private static member function that acts as the C callback.
@@ -164,19 +170,23 @@ void registerConnectedCallback(MqttConnectedCallback callback) {
  */
 
 class SAMPLE_derivedMqttClient : public MqttClient {
-  private:
-bool eventsRegistered=false;
+private:
+  bool eventsRegistered = false;
 
-//single instance. Notice! derived class must redeclare to store thier single instance and hide the base one.
-  static inline std::unique_ptr<SAMPLE_derivedMqttClient> _instance=nullptr; //REQUIRED TO SHADOW BASE
+  // single instance. Notice! derived class must redeclare to store thier single
+  // instance and hide the base one.
+  static inline std::unique_ptr<SAMPLE_derivedMqttClient> _instance =
+      nullptr; // REQUIRED TO SHADOW BASE
 
 public:
-  static esp_err_t create(esp_mqtt_client_config_t config);//REQUIRED TO SHADOW BASE
-   void send_ping_message(); //TODO temporary for testing - implement as bound to connect event launching timer led ping with reported info on the status of the ESP
+  static esp_err_t
+  create(esp_mqtt_client_config_t config); // REQUIRED TO SHADOW BASE
+  void send_ping_message(); // TODO temporary for testing - implement as bound
+                            // to connect event launching timer led ping with
+                            // reported info on the status of the ESP
 
-  static SAMPLE_derivedMqttClient* getInstance() {
-    return _instance.get();
-  };
+  static SAMPLE_derivedMqttClient *getInstance() { return _instance.get(); };
+
 protected:
   // This is the implementation of the pure virtual function from the base
   // class. You can't make this private because it needs to be accessible to the
