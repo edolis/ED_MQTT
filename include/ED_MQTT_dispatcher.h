@@ -20,6 +20,7 @@
 #include <vector>
 #include "secrets.h"
 #include <string>
+#include <map>
 
 using namespace ED_MQTT;
 
@@ -35,6 +36,80 @@ virtual void grabCommand(const std::string commandID, const std::string commandD
 
 };
 
+/**
+ * @brief defines a command callable from the user via MQTT
+ * in order to modify the behaviour of the application
+ */
+struct ctrlCommand {
+    enum class cmdScope {
+        LOCALONLY,
+        GLOBAL
+    };
+
+    std::string cmdID;
+    std::string cmdDex; // description
+    cmdScope scope;
+    std::unordered_map<std::string, std::string> optParam;
+
+    // Function pointer to handler
+    std::function<void(ctrlCommand*)> funcPointer;
+
+    // Help string generator
+    static std::string toHelpString(const ctrlCommand& cmd) {
+        std::string help = "Command: " + cmd.cmdID + "\n";
+        help += std::string("Scope: ")  + (cmd.scope == cmdScope::GLOBAL ? "GLOBAL" : "LOCALONLY") + "\n";
+        help += "Description: " + cmd.cmdDex + "\n";
+        help += "Options:\n";
+        for (const auto& [key, val] : cmd.optParam) {
+            help += "  - " + key + ": " + val + "\n";
+        }
+        return help;
+    }
+
+    // Static method to override parameters from JSON
+    static void overrideParams(ctrlCommand& cmd, const std::unordered_map<std::string, std::string>& jsonParams) {
+        for (const auto& [key, val] : jsonParams) {
+            cmd.optParam[key] = val;
+        }
+    }
+};
+
+class CommandRegistry {
+public:
+    void registerCommand(const ctrlCommand& cmd) {
+        registry[cmd.cmdID] = cmd;
+    }
+
+    bool dispatch(const std::string& cmdID) {
+      ESP_LOGI("DISPATCH","in dispatch step 2");
+      auto it = registry.find(cmdID);
+      if (it != registry.end()) {
+          ESP_LOGI("DISPATCH","in dispatch step 3");
+            ctrlCommand& cmd = it->second;
+            if (cmd.funcPointer) {
+                cmd.funcPointer(&cmd);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string getHelp() const {
+        std::string help;
+        for (const auto& [id, cmd] : registry) {
+            help += ctrlCommand::toHelpString(cmd) + "\n";
+        }
+        return help;
+    }
+
+    std::map<std::string, ctrlCommand>& getRegistry() {
+        return registry;
+    }
+
+private:
+    std::map<std::string, ctrlCommand> registry;
+};
+
 
 
 /**
@@ -45,18 +120,19 @@ virtual void grabCommand(const std::string commandID, const std::string commandD
 class MQTTdispatcher {
 
 public:
-    static void handleCommandObject(const ED_JSON::JsonEncoder &obj);
-    /// intialized the dispatcher with the given mosquitto configuration
-    static esp_err_t initialize(esp_mqtt_client_config_t *config = nullptr);
-    /// intialized the dispatcher with the default mosquitto configuration
-    //   static esp_err_t initialize();
-    /// runs the dispatcher
-    static esp_err_t run();
-  static  void subscribe(iCommand* subscriber) {
-        cmdSubscribers.push_back(subscriber);
-    }
+static void handleCommandObject(const ED_JSON::JsonEncoder &obj);
+/// intialized the dispatcher with the given mosquitto configuration
+static esp_err_t initialize(esp_mqtt_client_config_t *config = nullptr);
+/// intialized the dispatcher with the default mosquitto configuration
+//   static esp_err_t initialize();
+/// runs the dispatcher
+static esp_err_t run();
+static  void subscribe(iCommand* subscriber) {
+  cmdSubscribers.push_back(subscriber);
+}
 
 private:
+static bool parseCommand(const std::string &input, std::string &commandID, std::string &payload);
 static std::vector<iCommand*> cmdSubscribers;
 static inline esp_mqtt_client_handle_t clHandle=nullptr;
 static TaskHandle_t infoPublisherTaskHandle;

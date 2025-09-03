@@ -1,6 +1,7 @@
 #include "ED_MQTT_dispatcher.h"
 #include "ED_json.h"
 #include <esp_log.h>
+#include <regex>
 
 namespace ED_MQTT_dispatcher {
 
@@ -37,8 +38,20 @@ MqttDataCallback MQTTdispatcher::onMqttData =
       // printf("\n");
       // ESP_LOGI(TAG, "Raw payload: [%.*s]", data.length(), data.c_str());
 
+      // checks if it is command line format
+      std::string commandID;
+      std::string payload;
+      if (parseCommand(data, commandID, payload)) {
+        for (auto *sub : cmdSubscribers) {
+          ESP_LOGI(TAG, "calling");
+          sub->grabCommand(commandID, payload);
+        }
+        return;
+      }
       ED_JSON::JsonEncoder decoder(data);
-      if(decoder.isValidJson()) ESP_LOGI(TAG,"decoder creator turns %s into %s",data.c_str(),decoder.getJson().c_str() );
+      if (decoder.isValidJson())
+        ESP_LOGI(TAG, "decoder creator turns %s into %s", data.c_str(),
+                 decoder.getJson().c_str());
       // unpacks the array in case the client sends json as a json array
       auto unwrapped = decoder.unwrapNestedArray();
       ESP_LOGI(TAG, "unwrapper array?  %d", unwrapped.isArray());
@@ -47,7 +60,8 @@ MqttDataCallback MQTTdispatcher::onMqttData =
         ESP_LOGI(TAG, "array size %d", size);
         for (int i = 0; i < size; ++i) {
           auto item = unwrapped.getArrayItem(i);
-          ESP_LOGI(TAG, "Calling with item %d :  %s", i, item.getCompactJson().c_str());
+          ESP_LOGI(TAG, "Calling with item %d :  %s", i,
+                   item.getCompactJson().c_str());
           handleCommandObject(item);
         }
       } else if (unwrapped.isValidJson()) {
@@ -62,11 +76,24 @@ MqttDataCallback MQTTdispatcher::onMqttData =
       //     MqttClient::MqttQoS::QOS1, false);
     };
 
+bool MQTTdispatcher::parseCommand(const std::string& input, std::string& commandID, std::string& payload) {
+  std::regex pattern("^:([A-Za-z0-9]{1,6})\\s*(.*?)\\s*$");
+  std::smatch matches;
+
+  if (std::regex_match(input, matches, pattern)) {
+    commandID = matches[1]; // Captures the 6-character command
+    payload = matches[2];   // Captures everything after the space(s)
+    ESP_LOGI(TAG,"Step_1 <%s><%s>",commandID.c_str(),payload.c_str());
+    return true;
+  }
+
+  return false;
+}
 void MQTTdispatcher::handleCommandObject(const ED_JSON::JsonEncoder &obj) {
   // ESP_LOGI(TAG,"Step_2 isvalidjson %d",obj.isValidJson());
   if (!obj.isValidJson())
     return;
-// ESP_LOGI(TAG,"Step_3");
+  // ESP_LOGI(TAG,"Step_3");
   auto commandOpt = obj.getString("cmd");
   auto dataOpt = obj.getString("data");
 
@@ -150,5 +177,4 @@ void MQTTdispatcher::publishInfo() {
       stdPingJson().c_str(), 0, MqttClient::MqttQoS::QOS1, true);
   // ESP_LOGI(TAG, "END Timer callback executed!\n");
 };
-
 } // namespace ED_MQTT_dispatcher
