@@ -1,22 +1,22 @@
 // #region StdManifest
 /**
- * @file main_Json.cpp
- * @brief
- *
+ * @file main_Dispatcher.cpp
+ * @brief shown the use of Dispatcher, commands and OTA leveraging MQTT sent command to trigger and confirm partition as valid
+ * Working with TSL (MQTT) and SSH (file transfer and directory queries)
  *
  * @author Emanuele Dolis (edoliscom@gmail.com)
- * @version GIT_VERSION: v1.0.0.0-0-dirty
+ * @version GIT_VERSION: v1.0.0-0-dirty
  * @tagged as: SNTP-core
  * @commit hash: g5d100c9 [5d100c9e7fbf8030cd9e50ec7db3b7b6333dbee1]
- * @build ID: P20250902-222045-5d100c9
+ * @build ID: P20250910-154350-5d100c9
  *  @compiledSizeInfo begin
 
-    .iram0.text      85 720    .dram0.data  12 644
-    .flash.text     980 982    .dram0.bss   25 272
+    .iram0.text      85 874    .dram0.data  12 852
+    .flash.text     860 588    .dram0.bss   21 128
     .flash.appdesc      256    ―――――――――――――――――――
-    .flash.rodata   151 384    total        37 916
-    ―――――――――――――――――――――――                       
-    subtotal        1 218 342                       
+    .flash.rodata   146 972    total        33 980
+    ―――――――――――――――――――――――
+    subtotal        1 093 690
 
     @compiledSizeInfo end
  * @date 2025-08-28
@@ -45,58 +45,73 @@ struct GIT_fwInfo {
 #include "ED_wifi.h"
 #include "ED_mqtt.h"
 #include "ED_MQTT_dispatcher.h"
+#include "ED_OTA.h"
 #include <string.h>
 
 #ifdef DEBUG_BUILD
 #endif
 #include <map>
 #include <esp_log.h>
+#include <esp_ota_ops.h>
 
 using namespace ED_JSON;
 using namespace ED_SYSINFO;
 // using namespace ED_MQTT_dispatcher;
 
-class TestCmdReceiver: public ED_MQTT_dispatcher::iCommand{
+class TestCmdReceiver: public ED_MQTT_dispatcher::CommandWithRegistry{
 
 public:
-static ED_MQTT_dispatcher::CommandRegistry registry;
-virtual void grabCommand(const std::string commandID, const std::string commandData) override
-{
-ESP_LOGI("TestCmdReceiver", "received cmd [%s] data [%s]", commandID.c_str(), commandData.c_str());
-ED_MQTT_dispatcher::ctrlCommand* candidate = nullptr;
-auto& regMap = registry.getRegistry();
-auto it = regMap.find(commandID);
-if (it != regMap.end()) {
-  ESP_LOGI(TAG,"element found");
-    candidate = &it->second;
-    std::unordered_map<std::string, std::string> parsedParams = JsonEncoder::parseJsonToMap(commandData);
-    ED_MQTT_dispatcher::ctrlCommand::overrideParams(*candidate, parsedParams);
-    registry.dispatch(commandID);
-}
-};
 
-static void grabCommand(ED_MQTT_dispatcher::ctrlCommand * ctrcomd){
+
+static void EXECCommand(ED_MQTT_dispatcher::ctrlCommand * ctrcomd){
 
 ESP_LOGI("TestCmdReceive>GrabCommandr", "executing cmd [%s] cmd Help [%s]", ctrcomd->cmdID.c_str(), ED_MQTT_dispatcher::ctrlCommand::toHelpString(*ctrcomd).c_str());
 
 };
 
-static void init(){
+ void init(){
 
-  ED_MQTT_dispatcher::ctrlCommand sdpiCmd;
-sdpiCmd.cmdID = "SDPI";
-sdpiCmd.cmdDex = "Set data polling interval";
-sdpiCmd.scope = ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL;
-sdpiCmd.optParam["interval"] = "Polling interval in seconds";
-sdpiCmd.funcPointer = static_cast<void(*)(ED_MQTT_dispatcher::ctrlCommand*)>(&TestCmdReceiver::grabCommand);;
+  ED_MQTT_dispatcher::ctrlCommand sdpiCmd("SDPI","Set data polling interval",
+    ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL,{});
+
+sdpiCmd.funcPointer =
+    static_cast<void(*)(ED_MQTT_dispatcher::ctrlCommand*)>(&TestCmdReceiver::EXECCommand);;
 ESP_LOGI(TAG,"Step_ funcpointer is null? %d",sdpiCmd.funcPointer==nullptr);
 
-  registry.registerCommand(sdpiCmd);
+  registerCommand(sdpiCmd);
 };
 };
 
-ED_MQTT_dispatcher::CommandRegistry TestCmdReceiver::registry;
+// ED_MQTT_dispatcher::CommandRegistry TestCmdReceiver::registry;
 
+void check_ota_state_on_boot() {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    ESP_LOGI(TAG,"Step_in check ota state");
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        switch (ota_state) {
+            case ESP_OTA_IMG_PENDING_VERIFY:
+                ESP_LOGI(TAG, "OTA: Image is PENDING_VERIFY");
+                // Run your self-tests here, then either:
+                // On success:
+                esp_ota_mark_app_valid_cancel_rollback();
+                // On failure:
+                // esp_ota_mark_app_invalid_rollback_and_reboot();
+                break;
+            case ESP_OTA_IMG_VALID:
+                ESP_LOGI(TAG, "OTA: Image is VALID");
+                break;
+            case ESP_OTA_IMG_INVALID:
+                ESP_LOGW(TAG, "OTA: Image is INVALID");
+                break;
+            default:
+                ESP_LOGI(TAG, "OTA: Image state = %d", ota_state);
+                break;
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to get OTA state");
+    }
+}
 
 extern "C" void app_main(void) {
 
@@ -107,10 +122,8 @@ std::map<int, MacAddress> testMap;
 
 
 
-TestCmdReceiver::init();
 
-
-  char buffer[18] = "";
+  // char buffer[18] = "";
 
   ED_JSON::JsonEncoder encoder;
   ED_JSON::JsonEncoder encoderMAC;
@@ -130,13 +143,24 @@ TestCmdReceiver::init();
   encoder.add("nullKey", nullptr);
   encoder.add("arrayKey", std::vector<std::string>{"item1", "item2", "item3"});
 static TestCmdReceiver crec;
+crec.init();
 
-ED_wifi::WiFiService::subscribeToIPReady([]() {
+ED_OTA::OTAmanager otaUpdater;
+
+ED_SYSINFO::dump_ca_cert(ca_crt_start,ca_crt_end);
+
+
+ED_wifi::WiFiService::subscribeToIPReady([&]() {
     ED_MQTT_dispatcher::MQTTdispatcher::initialize();
 
     ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&crec);
+    ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&otaUpdater);
   });
   ED_wifi::WiFiService::launch();
+
+ESP_LOGI(TAG,"***App name: %s\n", ED_sysstd::ESP_std::fwPrjName());
+ESP_LOGI(TAG,"***Version: %s\n", ED_sysstd::ESP_std::fwVer());
+check_ota_state_on_boot();
 
   // Optional hardware setup
   // gpio_set_direction(LED_BUILTIN, GPIO_MODE_OUTPUT);

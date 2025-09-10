@@ -29,7 +29,7 @@ namespace ED_MQTT_dispatcher {
 
   // using MqttDataGrabber = std::function<void(,std::string,std::string)>;
 
-class iCommand{
+class iCommandRunner{
 
 public:
 virtual void grabCommand(const std::string commandID, const std::string commandData)=0;
@@ -51,6 +51,11 @@ struct ctrlCommand {
     cmdScope scope;
     std::unordered_map<std::string, std::string> optParam;
 
+     ctrlCommand(const std::string& id,
+                const std::string& dex,
+                cmdScope sc,
+                const std::unordered_map<std::string, std::string>& params = {})
+        : cmdID(id), cmdDex(dex), scope(sc), optParam(params) {}
     // Function pointer to handler
     std::function<void(ctrlCommand*)> funcPointer;
 
@@ -77,10 +82,21 @@ struct ctrlCommand {
 class CommandRegistry {
 public:
     void registerCommand(const ctrlCommand& cmd) {
-        registry[cmd.cmdID] = cmd;
+
+
+        registry.emplace(cmd.cmdID, cmd);
+        // registry[cmd.cmdID] = cmd; //this does not work unless you define a constructor for empty object
     }
+ ctrlCommand* getCommand(const std::string commandID) {
+        auto it = registry.find(commandID);
+    if (it != registry.end()) {
+        return &it->second;  // Return pointer to the found ctrlCommand
+    }
+    return nullptr;  // Not found
+    };
 
     bool dispatch(const std::string& cmdID) {
+        //NOTE needs removing?
       ESP_LOGI("DISPATCH","in dispatch step 2");
       auto it = registry.find(cmdID);
       if (it != registry.end()) {
@@ -110,6 +126,25 @@ private:
     std::map<std::string, ctrlCommand> registry;
 };
 
+class CommandWithRegistry : public iCommandRunner {
+public:
+    CommandRegistry registry;
+
+virtual void grabCommand(const std::string commandID, const std::string commandData)override ;
+
+
+    void registerCommand(const ctrlCommand& cmd) {
+        registry.registerCommand(cmd);
+    }
+
+    bool dispatchCommand(const std::string& cmdID) {
+        return registry.dispatch(cmdID);
+    }
+
+    std::string help() const {
+        return registry.getHelp();
+    }
+};
 
 
 /**
@@ -127,13 +162,27 @@ static esp_err_t initialize(esp_mqtt_client_config_t *config = nullptr);
 //   static esp_err_t initialize();
 /// runs the dispatcher
 static esp_err_t run();
-static  void subscribe(iCommand* subscriber) {
+/// subscribes a command handler to the dispatcher command received event
+static  void subscribe(iCommandRunner* subscriber) {
   cmdSubscribers.push_back(subscriber);
 }
 
 private:
+/**
+ * @brief parses a text command received from MQTT
+ * in the format
+ * :COMID parameterstring
+ * these commands are meant to be sent directly by the user by typing them as MQTT message.
+ * The commands managed by the application, instead, are meant to be sent as a JSON array
+ * and decoded by handleCommandObject
+ * @param input the full raw content of the MQTT message, unparsed
+ * @param commandID parsed command ID
+ * @param payload parsed payload
+ * @return true raw content was a command, and parsing was successful
+ * @return false raw contents was not in a suitable format
+ */
 static bool parseCommand(const std::string &input, std::string &commandID, std::string &payload);
-static std::vector<iCommand*> cmdSubscribers;
+static std::vector<iCommandRunner*> cmdSubscribers;
 static inline esp_mqtt_client_handle_t clHandle=nullptr;
 static TaskHandle_t infoPublisherTaskHandle;
 

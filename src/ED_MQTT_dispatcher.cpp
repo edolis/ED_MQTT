@@ -1,13 +1,22 @@
 #include "ED_MQTT_dispatcher.h"
 #include "ED_json.h"
 #include <esp_log.h>
-#include <regex>
+// #include <regex> do NOT use C++ regex with ESP32
+#include <regex.h>
 
 namespace ED_MQTT_dispatcher {
 
 static const char *TAG = "ED_MQTT_dispatcher";
 TaskHandle_t MQTTdispatcher::infoPublisherTaskHandle = nullptr;
-std::vector<iCommand *> MQTTdispatcher::cmdSubscribers = {};
+std::vector<iCommandRunner *> MQTTdispatcher::cmdSubscribers = {};
+
+std::string toupper(const std::string &input) {
+  std::string result = input;
+  std::transform(result.begin(), result.end(), result.begin(),
+                 [](unsigned char c) { return std::toupper(c); });
+  return result;
+}
+
 // #region MQTTdispatcher
 
 MqttConnectedCallback MQTTdispatcher::onMqttConnected =
@@ -29,8 +38,8 @@ MqttConnectedCallback MQTTdispatcher::onMqttConnected =
 
 MqttDataCallback MQTTdispatcher::onMqttData =
     [](esp_mqtt_client_handle_t client, std::string topic, std::string data) {
-      ESP_LOGI(TAG, "DISPATCHER Received topic [%s] data [%s] datalength %d",
-               topic.c_str(), data.c_str(), data.length());
+      // ESP_LOGI(TAG, "DISPATCHER Received topic [%s] data [%s] datalength %d",
+      //          topic.c_str(), data.c_str(), data.length());
 
       // for (size_t i = 0; i < data.length(); ++i) {
       //   printf("[%02X] ", static_cast<unsigned char>(data[i]));
@@ -42,8 +51,14 @@ MqttDataCallback MQTTdispatcher::onMqttData =
       std::string commandID;
       std::string payload;
       if (parseCommand(data, commandID, payload)) {
+        if (commandID == "H" || commandID == "HELP" || commandID == "HLP") {
+          ESP_LOGI(TAG, "Received request to spell implemented commands");
+          // TODO incomplete
+          return;
+        }
+
         for (auto *sub : cmdSubscribers) {
-          ESP_LOGI(TAG, "calling");
+          // ESP_LOGI(TAG, "calling");
           sub->grabCommand(commandID, payload);
         }
         return;
@@ -76,19 +91,48 @@ MqttDataCallback MQTTdispatcher::onMqttData =
       //     MqttClient::MqttQoS::QOS1, false);
     };
 
-bool MQTTdispatcher::parseCommand(const std::string& input, std::string& commandID, std::string& payload) {
-  std::regex pattern("^:([A-Za-z0-9]{1,6})\\s*(.*?)\\s*$");
-  std::smatch matches;
+bool MQTTdispatcher::parseCommand(const std::string &input,
+                                  std::string &commandID,
+                                  std::string &payload) {
+  regex_t regex;
+  regmatch_t matches[3]; // matches[0] = full match, [1] = commandID, [2] = payload
 
-  if (std::regex_match(input, matches, pattern)) {
-    commandID = matches[1]; // Captures the 6-character command
-    payload = matches[2];   // Captures everything after the space(s)
-    ESP_LOGI(TAG,"Step_1 <%s><%s>",commandID.c_str(),payload.c_str());
+  // POSIX-compatible pattern:
+  // ^: → starts with colon
+  // ([^[:space:]]+) → commandID: first non-space token after colon
+  // [[:space:]]* → optional whitespace
+  // (.*) → payload: everything else (can be empty)
+  const char *pattern = "^:([^[:space:]]+)[[:space:]]*(.*)$";
+
+  if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
+    ESP_LOGE(TAG, "Regex compilation failed");
+    return false;
+  }
+
+  int result = regexec(&regex, input.c_str(), 3, matches, 0);
+  regfree(&regex);
+
+  if (result == 0 && matches[1].rm_so != -1) {
+    // Extract commandID
+    int len1 = matches[1].rm_eo - matches[1].rm_so;
+    commandID = toupper(input.substr(matches[1].rm_so, len1));
+
+    // Extract payload
+    if (matches[2].rm_so != -1 && matches[2].rm_eo != -1) {
+      int len2 = matches[2].rm_eo - matches[2].rm_so;
+      payload = input.substr(matches[2].rm_so, len2);
+    } else {
+      payload.clear();
+    }
+
+    ESP_LOGI(TAG, "Parsed command: <%s> with payload: <%s>", commandID.c_str(), payload.c_str());
     return true;
   }
 
   return false;
 }
+
+
 void MQTTdispatcher::handleCommandObject(const ED_JSON::JsonEncoder &obj) {
   // ESP_LOGI(TAG,"Step_2 isvalidjson %d",obj.isValidJson());
   if (!obj.isValidJson())
@@ -177,4 +221,62 @@ void MQTTdispatcher::publishInfo() {
       stdPingJson().c_str(), 0, MqttClient::MqttQoS::QOS1, true);
   // ESP_LOGI(TAG, "END Timer callback executed!\n");
 };
+
+void CommandWithRegistry::grabCommand(const std::string commandID,
+                                      const std::string commandData) {
+  // receives a command ID and a string with the params,
+  //  matches the registered commands and updates the parameters
+  // and finally executes them
+  //  const char* input = "defaultvalue -p1 value -p2 -p3 othervalue";
+  const char *input = commandData.c_str();
+
+  ctrlCommand *cmd = nullptr;
+  cmd = registry.getCommand(commandID);
+
+  if (cmd == nullptr)
+    return; // command not found as managed command
+  // Step 1: extract defaultvalue
+  regex_t regex;
+  regmatch_t matches[2];
+  regcomp(&regex, "^([^[:space:]]+)", REG_EXTENDED);
+  if (regexec(&regex, input, 2, matches, 0) == 0) {
+    char defaultValue[64];
+    int len = matches[1].rm_eo - matches[1].rm_so;
+    strncpy(defaultValue, input + matches[1].rm_so, len);
+    defaultValue[len] = '\0';
+    printf("Default value: %s\n", defaultValue);
+    cmd->optParam["default"] = defaultValue;
+  }
+  regfree(&regex);
+
+  // Step 2: extract flags and values
+  regcomp(&regex, "-([[:alnum:]]+)([[:space:]]+([^[:space:]]+))?",
+          REG_EXTENDED);
+  const char *cursor = input;
+  while (regexec(&regex, cursor, 4, matches, 0) == 0) {
+    char flag[32], value[64] = "";
+    int flagLen = matches[1].rm_eo - matches[1].rm_so;
+    strncpy(flag, cursor + matches[1].rm_so, flagLen);
+    flag[flagLen] = '\0';
+
+    if (matches[3].rm_so != -1) {
+      int valLen = matches[3].rm_eo - matches[3].rm_so;
+      strncpy(value, cursor + matches[3].rm_so, valLen);
+      value[valLen] = '\0';
+    }
+
+    // printf("Flag: -%s, Value: %s\n", flag, value);
+    cmd->optParam[flag] = value;
+    if (matches[0].rm_eo > 0)
+      cursor += matches[0].rm_eo;
+    else
+      break; // Prevent infinite loop
+  }
+
+  // dispatches the command
+  if (cmd->funcPointer) {
+    cmd->funcPointer(cmd);
+  }
+};
+
 } // namespace ED_MQTT_dispatcher

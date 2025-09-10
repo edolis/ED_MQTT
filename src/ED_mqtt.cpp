@@ -324,9 +324,9 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
       //   printf("[%02X] ", static_cast<unsigned char>(data[i]));
       // }
       // printf("\n");
-      ESP_LOGI(TAG, "Raw payload: [%.*s]", partialPayload.length(), partialPayload.c_str());
-      ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
-      ESP_LOGI(TAG, "DATA=%s", partialPayload.c_str());
+      // ESP_LOGI(TAG, "Raw payload: [%.*s]", partialPayload.length(), partialPayload.c_str());
+      // ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
+      // ESP_LOGI(TAG, "DATA=%s", partialPayload.c_str());
 
       // Process full message
       // processMessage(event->topic, partialPayload);
