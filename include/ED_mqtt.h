@@ -63,18 +63,30 @@ ESP_EVENT_DECLARE_BASE(ED_MQTT_SENSOR_EVENTS);
 enum { ED_MQTT_SENSOR_EVENT_DATA_READY, ED_MQTT_SENSOR_EVENT_ERROR };
 
 // MqttClient.h
-// Embedded CA certificate
-extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
-extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
+// Embedded CA mqttd
+// NOTE! removed for switch to certificate bundle management to avoid using RAM
+// extern const uint8_t ca_crt_start[] asm("_binary_ca_crt_start");
+// extern const uint8_t ca_crt_end[] asm("_binary_ca_crt_end");
 
 extern const char *mqtt_event_names[];
 /// callback function type to allow subscribers perform action at mqtt
 /// connection
 using MqttConnectedCallback = std::function<void(esp_mqtt_client_handle_t)>;
-using MqttDataCallback = std::function<void(esp_mqtt_client_handle_t,std::string,std::string)>;
+/// @brief callback with client handle, topic, data, std msgID(broker assigned epoch)
+using MqttDataCallback = std::function<void(esp_mqtt_client_handle_t,
+                                           const char *, int, std::string&, int64_t)>;
 
 class MqttClient {
 private:
+  /**
+   * @brief Extract the "epoch" user property from an MQTT v5 event.
+   * the mqtt broker has been set up with an extension attaching epoch property as "epoch" to each
+   * message handled.
+   * This allows the client to send acknowledgements with a reference to a previous command ID
+   * @param event Pointer to the MQTT event handle (esp_mqtt_event_handle_t)
+   * @return int64_t The epoch value, or -1 if not found / not MQTT v5
+   */
+  static int64_t mqtt5_get_epoch_property(const esp_mqtt_event_t *event);
   static void setDefaultConfig();
   static inline std::vector<MqttConnectedCallback> connected_callbacks;
   static inline std::vector<MqttDataCallback> data_callbacks;
@@ -93,7 +105,7 @@ public:
     data_callbacks.push_back(callback);
   };
   // returns the handle of the mosquitto connection of the current instance
-   esp_mqtt_client_handle_t getHandle() ;
+  esp_mqtt_client_handle_t getHandle();
   /**
    * @brief initializes a singleton which creates and manages a single
    * MQTT connection and implement core

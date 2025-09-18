@@ -5,6 +5,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <iostream>
+#include "esp_crt_bundle.h"
 
 namespace ED_MQTT {
 
@@ -129,6 +130,66 @@ const esp_mqtt_client_config_t MqttClient::mqtt_default_cfg = {
 };
 */
 
+int64_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
+#ifdef CONFIG_MQTT_PROTOCOL_5
+  // Early validation
+  if (!event || !event->property || !event->property->user_property) {
+    // if(!event)  ESP_LOGI(TAG,"Step_event null");
+    //  else if (!event->property) ESP_LOGI(TAG,"Step_event->property null");
+    //  else if (!event->property->user_property)
+    //  ESP_LOGI(TAG,"Step_event->property->user_property  null" );
+    return -1;
+  }
+
+  mqtt5_user_property_handle_t handle = event->property->user_property;
+  uint8_t count = esp_mqtt5_client_get_user_property_count(handle);
+  // ESP_LOGI(TAG,"Step_count is %d",count);
+  if (count == 0) {
+    return -1;
+  }
+
+  // Use stack allocation for small property counts to avoid malloc/free
+  constexpr uint8_t STACK_THRESHOLD = 4;
+
+  if (count <= STACK_THRESHOLD) {
+    // Stack allocation - much faster for typical cases
+    esp_mqtt5_user_property_item_t items[STACK_THRESHOLD];
+    if (esp_mqtt5_client_get_user_property(handle, items, &count) == ESP_OK) {
+      for (uint8_t i = 0; i < count; i++) {
+        //  ESP_LOGI(TAG, "***Key: %s, Value: %s", items[i].key,
+        //  items[i].value);
+        if (items[i].key && strcmp(items[i].key, "epoch") == 0) {
+          return atoll(items[i].value);
+        }
+      }
+    }
+  } else {
+    // Heap allocation only for larger arrays
+    esp_mqtt5_user_property_item_t *items =
+        (esp_mqtt5_user_property_item_t *)malloc(
+            sizeof(esp_mqtt5_user_property_item_t) * count);
+    if (!items) {
+      return -1;
+    }
+
+    if (esp_mqtt5_client_get_user_property(handle, items, &count) == ESP_OK) {
+      for (uint8_t i = 0; i < count; i++) {
+        if (items[i].key && strcmp(items[i].key, "epoch") == 0) {
+          int64_t result = atoll(items[i].value);
+          free(items);
+          return result;
+        }
+      }
+    }
+    free(items);
+  }
+
+  return -1;
+#else
+  return -1;
+#endif
+}
+
 void MqttClient::setDefaultConfig() {
   /**
    * @brief note! required as defining it const creates crashes as there is no
@@ -149,16 +210,22 @@ void MqttClient::setDefaultConfig() {
                   {
                       .uri = ED_MQTT_URI,
                   },
+              // .verification =
+              //     {
+              //         .use_global_ca_store = false,
+              //         .certificate =
+              //             reinterpret_cast<const char *>(ca_crt_start),
+              //         .certificate_len = static_cast<size_t>(
+              //             reinterpret_cast<uintptr_t>(ca_crt_end) -
+              //             reinterpret_cast<uintptr_t>(ca_crt_start)),
+              //         .skip_cert_common_name_check = false,
+              //     },
               .verification =
-                  {
-                      .use_global_ca_store = false,
-                      .certificate =
-                          reinterpret_cast<const char *>(ca_crt_start),
-                      .certificate_len = static_cast<size_t>(
-                          reinterpret_cast<uintptr_t>(ca_crt_end) -
-                          reinterpret_cast<uintptr_t>(ca_crt_start)),
-                      .skip_cert_common_name_check = false,
-                  },
+                    {
+                        .use_global_ca_store = false,
+                        .crt_bundle_attach = esp_crt_bundle_attach,
+                        .skip_cert_common_name_check = false,
+                    },
           },
       .credentials =
           {
@@ -167,7 +234,7 @@ void MqttClient::setDefaultConfig() {
               .authentication =
                   {
                       .password = ED_MQTT_PASSWORD,
-                      .use_secure_element=false,
+                      .use_secure_element = false,
                   },
           },
       .session =
@@ -179,6 +246,7 @@ void MqttClient::setDefaultConfig() {
                       .qos = MqttQoS::QOS1,
                       .retain = true,
                   },
+              .protocol_ver = esp_mqtt_protocol_ver_t::MQTT_PROTOCOL_V_5,
           },
   };
   mqttConfig = cfg;
@@ -263,7 +331,12 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
     // can initialize just once. Since multiple derived classes and/or the base
     // classes share the same mqtt client, they just need to register their
     // event handlers
+ESP_LOGI(TAG, "Free heap: %d, Largest block: %d",
+         heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+         heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
     client = esp_mqtt_client_init(&config);
+    heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
     if (client == nullptr)
       return ESP_FAIL;
     err = esp_mqtt_client_start(client);
@@ -308,37 +381,49 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
   case MQTT_EVENT_ERROR:
     ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
     break;
-  case MQTT_EVENT_DATA:
-#ifdef DEBUG_BUILD
-
-    ESP_LOGI(TAG, "MQTT_EVENT_DATA");
-#endif
+  case MQTT_EVENT_DATA:{
     static std::string partialPayload;
-    // Append chunk to buffer
-    partialPayload.append(event->data, event->data_len);
+    static size_t expected_len = 0;
 
-    if (event->total_data_len == event->data_len + event->current_data_offset) {
-      // Last chunk received
-      ESP_LOGI(TAG, "Full message received:");
-      // for (size_t i = 0; i < data.length(); ++i) {
-      //   printf("[%02X] ", static_cast<unsigned char>(data[i]));
-      // }
-      // printf("\n");
-      // ESP_LOGI(TAG, "Raw payload: [%.*s]", partialPayload.length(), partialPayload.c_str());
-      // ESP_LOGI(TAG, "TOPIC=%.*s", event->topic_len, event->topic);
-      // ESP_LOGI(TAG, "DATA=%s", partialPayload.c_str());
+    // First chunk of a new message
+    if (event->current_data_offset == 0) {
+      partialPayload.clear();
+      expected_len = event->total_data_len;
 
-      // Process full message
-      // processMessage(event->topic, partialPayload);
+      // Reserve once to avoid multiple reallocations
+      if (expected_len > 0 && expected_len < 64 * 1024) {
+        partialPayload.reserve(expected_len);
+      }
+    }
 
-      for (const auto &callback : data_callbacks) {
-   callback(event->client, std::string(event->topic, event->topic_len), partialPayload);
+    // Cap growth to avoid runaway on malformed streams
+    constexpr size_t MAX_PAYLOAD = 16 * 1024;
+    if (partialPayload.size() + event->data_len <= MAX_PAYLOAD) {
+      partialPayload.append(event->data, event->data_len);
+    } else {
+      ESP_LOGW(TAG, "Payload too large, discarding");
+      partialPayload.clear();
+      expected_len = 0;
+      break;
+    }
 
+    // Last chunk?
+    if (event->total_data_len == event->current_data_offset + event->data_len) {
+      // Avoid constructing a new string if you can pass pointer+len
+      std::string topic(event->topic, event->topic_len);
+
+      // Callbacks should take const std::string& or (const char*, size_t)
+      for (auto &cb : data_callbacks) {
+        cb(event->client, event->topic, event->topic_len , partialPayload,
+           mqtt5_get_epoch_property(event));
       }
 
-      // Clear buffer
       partialPayload.clear();
+      expected_len = 0;
+    };
+    break;///
     }
+
   default:
     ESP_LOGI(TAG, "MQTT event id:%s", mqtt_event_names[event->event_id]);
     break;
