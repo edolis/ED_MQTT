@@ -1,13 +1,27 @@
 #include "ED_mqtt.h"
-#include "ED_sysstd.h"
+#include "ED_heap_tracer.h"
+#include "ED_sys.h"
+#include "esp_crt_bundle.h"
 #include "esp_event_base.h"
+#include "mqtt5_client.h"
 #include "secrets.h"
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <freertos/task.h>
 #include <iostream>
-#include "esp_crt_bundle.h"
+
 
 namespace ED_MQTT {
+
+static TimerHandle_t mqtt_reconnect_timer = nullptr;
+// ED_mqtt.cpp
+TaskHandle_t ED_MQTT::MqttClient::teardown_task_handle = nullptr;
+
+void MqttClient::mqtt_reconnect_timer_cb(TimerHandle_t xTimer) {
+  ESP_LOGI("MQTT", "Reconnect timer fired — creating new client");
+  // Call your existing init/start logic here
+  getInstance()->start(mqttConfig);
+}
 
 static const char *TAG = "ED_MQTT";
 
@@ -197,10 +211,12 @@ void MqttClient::setDefaultConfig() {
    * initialization takes place after app start
    *
    */
-  static std::string topicStr =
-      "devices/connection/" + std::string(ED_sysstd::ESP_std::mqttName());
-  static std::string msgStr = std::string(ED_sysstd::ESP_std::mqttName()) +
-                              " disconnected unexpectedly.";
+  static char topicBuf[64]; // adjust size as needed
+  static char msgBuf[64];   // adjust size as needed
+  snprintf(topicBuf, sizeof(topicBuf), "devices/connection/%s",
+           ED_SYS::ESP_std::Device::mqttName());
+  snprintf(msgBuf, sizeof(msgBuf), "%s disconnected unexpectedly.",
+           ED_SYS::ESP_std::Device::mqttName());
 
   esp_mqtt_client_config_t cfg = {};
   cfg = {
@@ -221,16 +237,16 @@ void MqttClient::setDefaultConfig() {
               //         .skip_cert_common_name_check = false,
               //     },
               .verification =
-                    {
-                        .use_global_ca_store = false,
-                        .crt_bundle_attach = esp_crt_bundle_attach,
-                        .skip_cert_common_name_check = false,
-                    },
+                  {
+                      .use_global_ca_store = false,
+                      .crt_bundle_attach = esp_crt_bundle_attach,
+                      .skip_cert_common_name_check = false,
+                  },
           },
       .credentials =
           {
               .username = ED_MQTT_USERNAME,
-              .client_id = ED_sysstd::ESP_std::mqttName(),
+              .client_id = ED_SYS::ESP_std::Device::mqttName(),
               .authentication =
                   {
                       .password = ED_MQTT_PASSWORD,
@@ -241,8 +257,8 @@ void MqttClient::setDefaultConfig() {
           {
               .last_will =
                   {
-                      .topic = topicStr.c_str(),
-                      .msg = msgStr.c_str(),
+                      .topic = topicBuf,
+                      .msg = msgBuf,
                       .qos = MqttQoS::QOS1,
                       .retain = true,
                   },
@@ -259,6 +275,12 @@ void MqttClient::setDefaultConfig() {
  * _instance variable of the derived class
  */
 MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
+
+  xTaskCreate(teardown_task, "mqtt_teardown",
+              4096, // stack size
+              NULL, // task parameter
+              tskIDLE_PRIORITY + 1, &teardown_task_handle);
+
   if (_instance == nullptr) { // avoid retrying to initialize when already done
     if (config != nullptr) {
       mqttConfig = *config;
@@ -331,10 +353,11 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
     // can initialize just once. Since multiple derived classes and/or the base
     // classes share the same mqtt client, they just need to register their
     // event handlers
-ESP_LOGI(TAG, "Free heap: %d, Largest block: %d",
-         heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-         heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    ESP_LOGI(TAG, "Free heap: %d, Largest block: %d",
+             heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+             heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
+    ED_heap_tracer::mqtt_heap_trace_start();
     client = esp_mqtt_client_init(&config);
     heap_caps_print_heap_info(MALLOC_CAP_DEFAULT);
     if (client == nullptr)
@@ -353,6 +376,34 @@ ESP_LOGI(TAG, "Free heap: %d, Largest block: %d",
   }
   return ESP_OK;
 }
+
+void MqttClient::scheduleReconnect(uint32_t delay_ms) {
+  if (mqtt_reconnect_timer == nullptr) {
+    mqtt_reconnect_timer =
+        xTimerCreate("mqtt_reconnect", pdMS_TO_TICKS(delay_ms),
+                     pdFALSE, // one-shot
+                     nullptr, mqtt_reconnect_timer_cb);
+  } else {
+    xTimerStop(mqtt_reconnect_timer, 0);
+    xTimerChangePeriod(mqtt_reconnect_timer, pdMS_TO_TICKS(delay_ms), 0);
+  }
+  xTimerStart(mqtt_reconnect_timer, 0);
+}
+
+void MqttClient::teardown_task(void *arg) {
+  auto *self = static_cast<MqttClient *>(arg);
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (self->client) {
+      ESP_LOGW(TAG, "Destroying MQTT client from safe context");
+      esp_mqtt_client_stop(self->client);
+      esp_mqtt_client_destroy(self->client);
+      self->client = nullptr;
+    }
+  }
+}
+
+
 
 void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                              void *event_data) {
@@ -376,14 +427,27 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
     }
     break;
   case MQTT_EVENT_DISCONNECTED:
+    if (isShortOutage()) {
+      // Let built-in reconnect do its thing
+      ESP_LOGW(TAG, "Transient disconnect — letting MQTT auto-reconnect");
+    } else {
+      // Hard failure — free everything
+      ESP_LOGE(TAG, "Prolonged/fatal disconnect — tearing down client");
+      ED_heap_tracer::mqtt_heap_trace_snapshot_async(); // snapshot here too
+      destroyClient();
+      scheduleReconnect(3000); // create a fresh client after delay
+    }
     ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
     break;
   case MQTT_EVENT_ERROR:
+    ED_heap_tracer::mqtt_heap_trace_snapshot_async(); // snapshot here too
+    xTaskNotify(teardown_task_handle, 0, eNoAction);
     ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
     break;
-  case MQTT_EVENT_DATA:{
+  case MQTT_EVENT_DATA: {
     static std::string partialPayload;
     static size_t expected_len = 0;
+
 
     // First chunk of a new message
     if (event->current_data_offset == 0) {
@@ -414,20 +478,29 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
 
       // Callbacks should take const std::string& or (const char*, size_t)
       for (auto &cb : data_callbacks) {
-        cb(event->client, event->topic, event->topic_len , partialPayload,
+        cb(event->client, event->topic, event->topic_len, partialPayload,
            mqtt5_get_epoch_property(event));
       }
 
       partialPayload.clear();
       expected_len = 0;
     };
-    break;///
-    }
-
-  default:
-    ESP_LOGI(TAG, "MQTT event id:%s", mqtt_event_names[event->event_id]);
-    break;
+    break; ///
   }
+
+default: {
+  int id = event->event_id;
+  const char *name = nullptr;
+  if (id >= 0 &&
+      id < (int)(sizeof(mqtt_event_names) / sizeof(mqtt_event_names[0]))) {
+    name = mqtt_event_names[id];
+  } else {
+    name = "MQTT_EVENT_UNKNOWN";
+  }
+  ESP_LOGI(TAG, "MQTT event id:%d (%s)", id, name);
+  break;
+}
+}
 }
 
 MqttClient::~MqttClient() {
@@ -445,6 +518,40 @@ MqttClient::~MqttClient() {
     esp_mqtt_client_destroy(client);
     client = nullptr;
   }
+}
+void MqttClient::destroyClient() {
+  if (client) {
+    ESP_LOGW(TAG, "Destroying MQTT client and freeing resources");
+    esp_mqtt_client_stop(client);    // stop task & close transport
+    esp_mqtt_client_destroy(client); // free all buffers & handle
+    client = nullptr;
+  }
+}
+
+bool MqttClient::isShortOutage() {
+  int64_t now = esp_timer_get_time() / 1000000; // seconds
+  int64_t since_last = now - last_disconnect_time;
+
+  // Update tracking
+  last_disconnect_time = now;
+  disconnect_count++;
+
+  // Define your thresholds
+  const int MAX_DISCONNECTS = 3;   // tolerate up to 3 quick drops
+  const int SHORT_WINDOW_SEC = 60; // within 60 seconds
+
+  if (since_last > SHORT_WINDOW_SEC) {
+    // Reset counter if last drop was long ago
+    disconnect_count = 1;
+    return true; // treat as short outage
+  }
+
+  if (disconnect_count <= MAX_DISCONNECTS) {
+    return true; // still within tolerance
+  }
+
+  // Too many quick failures → treat as hard outage
+  return false;
 }
 
 /**
@@ -465,6 +572,7 @@ MqttClient::~MqttClient() {
  */
 esp_err_t SAMPLE_derivedMqttClient::create(esp_mqtt_client_config_t config) {
   // TODO set clientID, improve handling of config
+
   auto instance = std::make_unique<SAMPLE_derivedMqttClient>();
   esp_err_t err = instance->start(config);
   if (err != ESP_OK) {
@@ -495,6 +603,7 @@ void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
     ESP_LOGW(TAG, "MQTT_EVENT_DISCONNECTED — attempting reconnect...");
     break;
   case MQTT_EVENT_ERROR:
+
     ESP_LOGE(TAG, "MQTT_EVENT_ERROR — transport error");
     break;
   case MQTT_USER_EVENT:

@@ -96,6 +96,14 @@ private:
   static inline std::unique_ptr<MqttClient> _instance = nullptr;
   /// @brief default configuration for the connection to the mosquitto broker
   static const esp_mqtt_client_config_t mqtt_default_cfg;
+    void destroyClient();
+    bool isShortOutage();
+    void  scheduleReconnect(uint32_t delay_ms);
+    static void teardown_task(void *arg);
+    static TaskHandle_t teardown_task_handle;
+    static inline int disconnect_count = 0;
+    static inline int64_t last_disconnect_time = 0;
+
 
 public:
   void registerConnectedCallback(MqttConnectedCallback callback) {
@@ -142,6 +150,8 @@ private:
   /// base class to the instance callback of the most derived class
   static void mqtt_event_trampoline(void *handler_args, esp_event_base_t base,
                                     int32_t event_id, void *event_data);
+static void mqtt_reconnect_timer_cb(TimerHandle_t xTimer);
+
 
 protected:
   /**
@@ -149,29 +159,29 @@ protected:
    * @param config
    * @return esp_err_t
    */
-  esp_err_t start(esp_mqtt_client_config_t config);
-  // Public method to register the handler.
-  // Derived classes can call this to link their instance to the event loop.
-  // void registerHandler(esp_mqtt_client_handle_t client);
-  esp_mqtt_client_handle_t client =
-      nullptr; // not static as multiple derived classes might be used
-               // simultaneously
+    esp_err_t start(esp_mqtt_client_config_t config);
+    // Public method to register the handler.
+    // Derived classes can call this to link their instance to the event loop.
+    // void registerHandler(esp_mqtt_client_handle_t client);
+    esp_mqtt_client_handle_t client =
+        nullptr; // not static as multiple derived classes might be used
+                 // simultaneously
 
-  // This is the private static member function that acts as the C callback.
-  // It's static to remove the implicit 'this' pointer.
-  // static void handleEventCallback(void *handler_args, esp_event_base_t base,
-  //                                 int32_t event_id, void *event_data);
-  /**
-   * @brief provides a base implementation for the core MQTT events.
-   * Derived classes can extend or partially override by processing selected
-   * events and calling base class to access default im,plementation
-   *
-   * @param base
-   * @param event_id
-   * @param event_data
-   */
-  virtual void handleEvent(esp_event_base_t base, int32_t event_id,
-                           void *event_data);
+    // This is the private static member function that acts as the C callback.
+    // It's static to remove the implicit 'this' pointer.
+    // static void handleEventCallback(void *handler_args, esp_event_base_t base,
+    //                                 int32_t event_id, void *event_data);
+    /**
+     * @brief provides a base implementation for the core MQTT events.
+     * Derived classes can extend or partially override by processing selected
+     * events and calling base class to access default im,plementation
+     *
+     * @param base
+     * @param event_id
+     * @param event_data
+     */
+    virtual void handleEvent(esp_event_base_t base, int32_t event_id,
+                             void *event_data);
 };
 
 /**
