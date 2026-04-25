@@ -43,7 +43,7 @@ struct GIT_fwInfo {
 
 
 #include "ED_esp_err.h"
-#include "ED_mqtt_CRTP.h"
+#include "ED_mqtt.h"
 #include "ED_sysInfo.h"
 #include "ED_wifi.h"
 
