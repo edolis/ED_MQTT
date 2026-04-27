@@ -1,36 +1,27 @@
 #include "ED_MQTT_dispatcher.h"
 #include "ED_json.h"
 #include "ED_sys.h"
-#include "ED_wifi.h"  // for subscribeToIPReady
+#include "ED_wifi.h"
+#include "esp_log.h"
 #include <cstring>
 #include <cctype>
-#include <esp_log.h>
 
 namespace ED_MQTT_dispatcher {
 
 static const char *TAG = "MQTTdisp";
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Static member definitions
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── Static members ───────────────────────────────────────────────────
 iCommandRunner *MQTTdispatcher::s_subscribers[MAX_CMD_SUBSCRIBERS] = {};
 uint8_t         MQTTdispatcher::s_subscriber_count                  = 0;
 
 esp_mqtt_client_handle_t MQTTdispatcher::s_clHandle       = nullptr;
 TaskHandle_t             MQTTdispatcher::s_info_task_handle = nullptr;
 TimerHandle_t            MQTTdispatcher::s_info_timer       = nullptr;
-TimerHandle_t            MQTTdispatcher::s_data_loops[MAX_DATA_LOOPS] = {};
-uint8_t                  MQTTdispatcher::s_data_loop_count            = 0;
+char                     MQTTdispatcher::s_mqtt_id[18]      = {};
+ED_MQTT::MqttClient     *MQTTdispatcher::s_mqtt             = nullptr;
+esp_mqtt_client_config_t *MQTTdispatcher::s_config          = nullptr;
 
-char                          MQTTdispatcher::s_mqtt_id[18]  = {};
-ED_MQTT::MqttClient          *MQTTdispatcher::s_mqtt         = nullptr;
-esp_mqtt_client_config_t     *MQTTdispatcher::s_config       = nullptr;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  ctrlCommand helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── ctrlCommand helpers ─────────────────────────────────────────────
 const char *ctrlCommand::getParam(const char *key) const {
     for (uint8_t i = 0; i < paramCount; ++i)
         if (strncmp(optParam[i].key, key, PARAM_KEY_LEN) == 0)
@@ -46,7 +37,7 @@ bool ctrlCommand::setParam(const char *key, const char *val) {
             return true;
         }
     }
-    return false; // key not found
+    return false;
 }
 
 bool ctrlCommand::addParam(const char *key, const char *default_val) {
@@ -60,43 +51,27 @@ bool ctrlCommand::addParam(const char *key, const char *default_val) {
 }
 
 void ctrlCommand::appendHelp(char *buf, size_t len) const {
-    size_t used = strnlen(buf, len);
-    int n = snprintf(buf + used, len - used,
-                     ":%s [%s] \"%s\"\n",
-                     cmdID,
-                     scope == cmdScope::GLOBAL ? "GLOBAL" : "LOCAL",
-                     cmdDex);
-    used += (n > 0) ? (size_t)n : 0;
-    for (uint8_t i = 0; i < paramCount && used < len - 1; ++i) {
-        n = snprintf(buf + used, len - used,
-                     "  -%s  (default: \"%s\")\n",
-                     optParam[i].key, optParam[i].val);
-        used += (n > 0) ? (size_t)n : 0;
-    }
+    // Not used
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CommandRegistry
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── CommandRegistry ──────────────────────────────────────────────────
 void CommandRegistry::registerCommand(const ctrlCommand &cmd) {
     if (count >= MAX_COMMANDS) {
         ESP_LOGE("CmdReg", "Command table full (max %d)", MAX_COMMANDS);
         return;
     }
-    // Avoid duplicates
     for (uint8_t i = 0; i < count; ++i)
-        if (strncmp(entries[i].cmdID, cmd.cmdID, CMD_ID_LEN) == 0) {
-            entries[i] = cmd; // overwrite
+        if (strcmp(entries[i].cmdID, cmd.cmdID) == 0) {
+            entries[i] = cmd;
             return;
         }
     entries[count++] = cmd;
 }
 
-ctrlCommand *CommandRegistry::getCommand(const char *cmdID) {
+ctrlCommand *CommandRegistry::getCommand(const char *cmdID) const {
     for (uint8_t i = 0; i < count; ++i)
-        if (strncmp(entries[i].cmdID, cmdID, CMD_ID_LEN) == 0)
-            return &entries[i];
+        if (strcmp(entries[i].cmdID, cmdID) == 0)
+            return const_cast<ctrlCommand*>(&entries[i]);
     return nullptr;
 }
 
@@ -109,20 +84,43 @@ bool CommandRegistry::dispatch(const char *cmdID) {
     return false;
 }
 
-void CommandRegistry::getHelp(char *buf, size_t len) const {
-    if (len == 0) return;
+void CommandRegistry::getHelpBrief(char *buf, size_t len) const {
     buf[0] = '\0';
-    for (uint8_t i = 0; i < count; ++i)
-        entries[i].appendHelp(buf, len);
+    size_t used = 0;
+    for (uint8_t i = 0; i < count && used < len; ++i) {
+        const ctrlCommand &cmd = entries[i];
+        used += snprintf(buf + used, len - used, "  %s - %s\n",
+                         cmd.cmdID, cmd.cmdDex ? cmd.cmdDex : "");
+    }
+    if (used == 0 && len > 0)
+        snprintf(buf, len, "  No commands.\n");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CommandWithRegistry::grabCommand
-//  Parses raw payload "-flagName value …" into ctrlCommand.optParam slots,
-//  then calls the command's funcPointer.
-//  No std::string — all work done on const char* with pointer arithmetic.
-// ─────────────────────────────────────────────────────────────────────────────
+void CommandRegistry::getHelpDetail(const char *cmdID, char *buf, size_t len) const {
+    const ctrlCommand *cmd = nullptr;
+    for (uint8_t i = 0; i < count; ++i)
+        if (strcmp(entries[i].cmdID, cmdID) == 0) {
+            cmd = &entries[i];
+            break;
+        }
+    if (!cmd) {
+        snprintf(buf, len, "Command '%s' not found.", cmdID);
+        return;
+    }
+    size_t used = snprintf(buf, len, "%s: %s\n", cmd->cmdID,
+                           cmd->cmdDex ? cmd->cmdDex : "");
+    if (cmd->paramCount > 0) {
+        used += snprintf(buf + used, len - used, "Parameters:\n");
+        for (uint8_t i = 0; i < cmd->paramCount && used < len; ++i) {
+            used += snprintf(buf + used, len - used, "  -%s (default: %s)\n",
+                             cmd->optParam[i].key, cmd->optParam[i].val);
+        }
+    } else {
+        used += snprintf(buf + used, len - used, "No parameters.\n");
+    }
+}
 
+// ── CommandWithRegistry::grabCommand (injects _msgID and _original) ──
 void CommandWithRegistry::grabCommand(const char *commandID,
                                       const char *commandData,
                                       size_t      /*dataLen*/,
@@ -130,15 +128,22 @@ void CommandWithRegistry::grabCommand(const char *commandID,
     ctrlCommand *cmd = registry.getCommand(commandID);
     if (!cmd) return;
 
-    // Store message ID
-    char idbuf[24];
-    snprintf(idbuf, sizeof idbuf, "%lld", (long long)msgID);
-    if (!cmd->setParam("_msgID", idbuf)) cmd->addParam("_msgID", idbuf);
+    // Inject _msgID
+    char msgIDstr[24];
+    snprintf(msgIDstr, sizeof(msgIDstr), "%lld", (long long)msgID);
+    if (!cmd->setParam("_msgID", msgIDstr))
+        cmd->addParam("_msgID", msgIDstr);
 
+    // Inject the original full command (commandID + commandData)
+    char originalBuf[PARAM_VAL_LEN];
+    snprintf(originalBuf, sizeof(originalBuf), "%s %s", commandID, commandData ? commandData : "");
+    if (!cmd->setParam("_original", originalBuf))
+        cmd->addParam("_original", originalBuf);
+
+    // Parse colon‑format flags: -key value
     const char *p = commandData;
     if (!p) p = "";
 
-    // Skip leading whitespace
     while (*p && isspace((unsigned char)*p)) ++p;
 
     // First token = default value (if not a flag)
@@ -150,7 +155,8 @@ void CommandWithRegistry::grabCommand(const char *commandID,
         if (n >= sizeof tmp) n = sizeof tmp - 1;
         memcpy(tmp, d0, n);
         tmp[n] = '\0';
-        if (!cmd->setParam("_default", tmp)) cmd->addParam("_default", tmp);
+        if (!cmd->setParam("_default", tmp))
+            cmd->addParam("_default", tmp);
     }
 
     // Remaining tokens: -key [value]
@@ -159,7 +165,6 @@ void CommandWithRegistry::grabCommand(const char *commandID,
         if (*p != '-') break;
         ++p;
 
-        // key
         const char *f0 = p;
         while (*p && isalnum((unsigned char)*p)) ++p;
         char flagbuf[PARAM_KEY_LEN];
@@ -168,7 +173,6 @@ void CommandWithRegistry::grabCommand(const char *commandID,
         memcpy(flagbuf, f0, flen);
         flagbuf[flen] = '\0';
 
-        // optional value
         while (*p && isspace((unsigned char)*p)) ++p;
         char valbuf[PARAM_VAL_LEN] = {};
         if (*p && *p != '-') {
@@ -179,16 +183,103 @@ void CommandWithRegistry::grabCommand(const char *commandID,
             memcpy(valbuf, v0, vlen);
         }
 
-        if (!cmd->setParam(flagbuf, valbuf)) cmd->addParam(flagbuf, valbuf);
+        if (!cmd->setParam(flagbuf, valbuf))
+            cmd->addParam(flagbuf, valbuf);
     }
 
-    if (cmd->funcPointer) cmd->funcPointer(cmd);
+    if (cmd->funcPointer)
+        cmd->funcPointer(cmd);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MQTTdispatcher — subscribe
-// ─────────────────────────────────────────────────────────────────────────────
+// ── GlobalCommandRegistry (singleton) ───────────────────────────────
+GlobalCommandRegistry &GlobalCommandRegistry::instance() {
+    static GlobalCommandRegistry inst;
+    return inst;
+}
 
+void GlobalCommandRegistry::setBaseUrl(const char *url) {
+    m_baseUrl = url;
+}
+
+bool GlobalCommandRegistry::registerRegistry(const char *regID,
+                                              CommandRegistry *reg,
+                                              const char *briefDesc) {
+    if (m_count >= MAX_REGISTRIES || !regID || !reg) return false;
+    m_registries[m_count++] = {regID, reg, briefDesc};
+    return true;
+}
+
+RegistryInfo *GlobalCommandRegistry::findRegistry(const char *regID) const {
+    for (uint8_t i = 0; i < m_count; ++i)
+        if (strcmp(m_registries[i].regID, regID) == 0)
+            return const_cast<RegistryInfo*>(&m_registries[i]);
+    return nullptr;
+}
+
+void GlobalCommandRegistry::getHelpOverview(char *buf, size_t len) const {
+    if (!m_baseUrl) {
+        snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
+        return;
+    }
+    if (m_count == 0) {
+        snprintf(buf, len, "No registries available.");
+        return;
+    }
+    size_t used = snprintf(buf, len, "Documentation: %s#cmd_index\n\nRegistries:\n", m_baseUrl);
+    for (uint8_t i = 0; i < m_count && used < len; ++i) {
+        used += snprintf(buf + used, len - used, "  %s - %s\n",
+                         m_registries[i].regID,
+                         m_registries[i].briefDesc ? m_registries[i].briefDesc : "");
+    }
+}
+
+void GlobalCommandRegistry::getRegistryHelp(const char *regID, char *buf, size_t len) const {
+    if (!m_baseUrl) {
+        snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
+        return;
+    }
+    RegistryInfo *info = findRegistry(regID);
+    if (!info) {
+        snprintf(buf, len, "Registry '%s' not found.", regID);
+        return;
+    }
+    size_t used = snprintf(buf, len, "Registry %s: %s\nDocumentation: %s#%s\n\nCommands:\n",
+                           info->regID, info->briefDesc ? info->briefDesc : "",
+                           m_baseUrl, info->regID);
+    info->registry->getHelpBrief(buf + used, len - used);
+}
+
+void GlobalCommandRegistry::getCommandHelp(const char *regID, const char *cmdID,
+                                           char *buf, size_t len) const {
+    if (!m_baseUrl) {
+        snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
+        return;
+    }
+    RegistryInfo *info = findRegistry(regID);
+    if (!info) {
+        snprintf(buf, len, "Registry '%s' not found.", regID);
+        return;
+    }
+    const ctrlCommand *cmd = info->registry->getCommand(cmdID);
+    if (!cmd) {
+        snprintf(buf, len, "Command '%s' not found in registry %s.", cmdID, regID);
+        return;
+    }
+    size_t used = snprintf(buf, len, "%s: %s\n", cmd->cmdID,
+                           cmd->cmdDex ? cmd->cmdDex : "");
+    if (cmd->paramCount > 0) {
+        used += snprintf(buf + used, len - used, "Parameters:\n");
+        for (uint8_t i = 0; i < cmd->paramCount && used < len; ++i) {
+            used += snprintf(buf + used, len - used, "  -%s (default: %s)\n",
+                             cmd->optParam[i].key, cmd->optParam[i].val);
+        }
+    } else {
+        used += snprintf(buf + used, len - used, "No parameters.\n");
+    }
+    snprintf(buf + used, len - used, "Full details: %s#%s", m_baseUrl, info->regID);
+}
+
+// ── MQTTdispatcher implementation ────────────────────────────────────
 void MQTTdispatcher::subscribe(iCommandRunner *subscriber) {
     if (s_subscriber_count >= MAX_CMD_SUBSCRIBERS) {
         ESP_LOGE(TAG, "subscriber table full (max %d)", MAX_CMD_SUBSCRIBERS);
@@ -197,12 +288,8 @@ void MQTTdispatcher::subscribe(iCommandRunner *subscriber) {
     s_subscribers[s_subscriber_count++] = subscriber;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Command parsing: ":CMDID [payload]"
-// ─────────────────────────────────────────────────────────────────────────────
-
 bool MQTTdispatcher::parseCommand(const char *input, size_t inputLen,
-                                  char *cmdID,  size_t cmdIDLen,
+                                  char *cmdID, size_t cmdIDLen,
                                   char *payload, size_t payloadLen) {
     if (!input || inputLen == 0 || input[0] != ':') return false;
 
@@ -229,10 +316,6 @@ bool MQTTdispatcher::parseCommand(const char *input, size_t inputLen,
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MQTT connected callback — plain static function, no lambda, no heap
-// ─────────────────────────────────────────────────────────────────────────────
-
 void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
     static char topic_conn[64];
     static char topic_info[64];
@@ -249,61 +332,54 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
     if (n < 0) n = 0;
 
     esp_mqtt_client_publish(client, topic_conn, msg, n,
-                            MqttClient::MqttQoS::QOS1, true);
+                            ED_MQTT::MqttClient::MqttQoS::QOS1, true);
     esp_mqtt_client_subscribe(client, "cmd", 0);
 
-    // Publish info JSON
     static char info_buf[512];
     build_ping_json(info_buf, sizeof info_buf);
     esp_mqtt_client_publish(client, topic_info, info_buf, strlen(info_buf),
-                            MqttClient::MqttQoS::QOS1, true);
+                            ED_MQTT::MqttClient::MqttQoS::QOS1, true);
 
-    // Update the handle in case client was recreated
     s_clHandle = client;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MQTT data callback — plain static function
-//  data/dataLen come from the static s_payload_buf in ED_mqtt.cpp — do NOT
-//  store the pointer beyond this call, and do NOT construct std::string from it.
-// ─────────────────────────────────────────────────────────────────────────────
-
 void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
                                   const char */*topic*/, int /*topicLen*/,
-                                  const char *data,      size_t dataLen,
+                                  const char *data, size_t dataLen,
                                   int64_t msgID) {
-    // ── Try ":CMD payload" format ─────────────────────────────────────────────
     char cmdID[CMD_ID_LEN];
-    char payload_buf[256]; // max CLI payload we accept
+    char payload_buf[256];
     if (parseCommand(data, dataLen, cmdID, sizeof cmdID, payload_buf, sizeof payload_buf)) {
-        if (strcmp(cmdID, "H") == 0 || strcmp(cmdID, "HELP") == 0 ||
-            strcmp(cmdID, "HLP") == 0) {
-            ESP_LOGI(TAG, "HELP requested — not yet implemented");
+        // HELP command handling
+        if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
+            static char helpBuf[1024];
+            char arg1[CMD_ID_LEN] = {0};
+            char arg2[CMD_ID_LEN] = {0};
+            sscanf(payload_buf, "%15s %15s", arg1, arg2);
+
+            if (arg2[0] != '\0')
+                GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf, sizeof(helpBuf));
+            else if (arg1[0] != '\0')
+                GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf, sizeof(helpBuf));
+            else
+                GlobalCommandRegistry::instance().getHelpOverview(helpBuf, sizeof(helpBuf));
+
+            esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf, strlen(helpBuf), 0, 0);
             return;
         }
+
+        // Normal colon command
         for (uint8_t i = 0; i < s_subscriber_count; ++i)
             if (s_subscribers[i])
-                s_subscribers[i]->grabCommand(cmdID, payload_buf,
-                                              strlen(payload_buf), msgID);
+                s_subscribers[i]->grabCommand(cmdID, payload_buf, strlen(payload_buf), msgID);
         return;
     }
 
-    // ── Try JSON format ───────────────────────────────────────────────────────
-    // ED_JSON::JsonEncoder takes a null-terminated string. The payload buffer in
-    // ED_mqtt.cpp is MAX_MQTT_PAYLOAD+1 bytes and is null-terminated after
-    // assembly, so passing data directly is safe.
+    // Try JSON format
     handleCommandObject(data, dataLen, msgID);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  handleCommandObject — parse JSON and dispatch to subscribers
-// ─────────────────────────────────────────────────────────────────────────────
-
-void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
-                                         int64_t cmdID) {
-    // ED_JSON::JsonEncoder is used as-is — we have no control over its
-    // internal allocations, but command reception is infrequent so transient
-    // allocation here is acceptable.
+void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/, int64_t cmdID) {
     ED_JSON::JsonEncoder decoder(json);
     if (!decoder.isValidJson()) return;
 
@@ -333,16 +409,12 @@ void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
                     s_subscribers[i]->grabCommand(c, d, strlen(d), cmdID);
         }
     } else {
-        ESP_LOGW(TAG, "Malformed payload — not a command and not valid JSON");
+        ESP_LOGW(TAG, "Malformed payload – not a command and not valid JSON");
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  ackCommand — no std::string in signature
-// ─────────────────────────────────────────────────────────────────────────────
-
 void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
-                                ackType ackResult, const char *payload) {
+                                ackType ackResult, const char *originalCommand) {
     static char topic_ack[64];
     static bool built = false;
     if (!built) {
@@ -351,26 +423,19 @@ void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
     }
 
     char ackbuf[256];
-    int n = snprintf(ackbuf, sizeof ackbuf, "[%lld][%s] %s\n%s",
-                     (long long)reqMsgID,
-                     commandID ? commandID : "?",
-                     ackResult == ackType::OK ? "OK" : "FAIL",
-                     payload ? payload : "");
+    const char *display = (originalCommand && originalCommand[0]) ? originalCommand : commandID;
+    int n = snprintf(ackbuf, sizeof ackbuf, "[%s] %s",
+                     display ? display : "?",
+                     ackResult == ackType::OK ? "OK" : "FAIL");
     if (n < 0) n = 0;
     if (n >= (int)sizeof ackbuf) n = (int)sizeof ackbuf - 1;
 
-    int rc = esp_mqtt_client_publish(s_clHandle, topic_ack, ackbuf, n,
-                                     MqttClient::MqttQoS::QOS1, false);
-    ESP_LOGI(TAG, "ackCommand rc=%d", rc);
+    esp_mqtt_client_publish(s_clHandle, topic_ack, ackbuf, n,
+                            ED_MQTT::MqttClient::MqttQoS::QOS1, false);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Periodic info publish — static buffer, no std::string
-// ─────────────────────────────────────────────────────────────────────────────
-
 void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
-    // Build JSON manually — avoids ED_JSON heap alloc on the hot periodic path
-    int n = snprintf(buf, len,
+    snprintf(buf, len,
         "{\"StationID\":\"%s\",\"NetID\":\"%s\",\"MAC\":\"%s\","
         "\"IP\":\"%s\",\"time\":\"%s\",\"upTime\":\"%s\","
         "\"location\":\"\",\"Project\":\"\"}",
@@ -380,8 +445,6 @@ void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
         ED_SYS::ESP_std::Device::curIP(),
         ED_SYS::ESP_std::Runtime::curStdTime(),
         ED_SYS::ESP_std::Runtime::uptime());
-    if (n < 0 || n >= (int)len)
-        buf[len - 1] = '\0';
 }
 
 void MQTTdispatcher::T_info_timer_callback(TimerHandle_t /*handle*/) {
@@ -410,23 +473,18 @@ void MQTTdispatcher::publishInfo() {
     build_ping_json(buf, sizeof buf);
 
     int rc = esp_mqtt_client_publish(s_clHandle, topic_info, buf, strlen(buf),
-                                     MqttClient::MqttQoS::QOS0, true);
+                                     ED_MQTT::MqttClient::MqttQoS::QOS0, true);
     if (rc < 0)
         ESP_LOGE(TAG, "publishInfo failed");
     else
         ESP_LOGI(TAG, "publishInfo ok msg_id=%d", rc);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  initialize() — store config, do NOT start MQTT yet (no IP yet)
-// ─────────────────────────────────────────────────────────────────────────────
-
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
     strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
 
-    s_config = config; // store pointer — create() copies it internally
+    s_config = config;
 
-    // Register the info publish timer (not started yet — run() starts it)
     s_info_timer = xTimerCreate("info_loop",
                                 pdMS_TO_TICKS(3000),
                                 pdTRUE, nullptr,
@@ -443,17 +501,7 @@ esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
     return ESP_OK;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  run() — subscribe to IP-ready, then start MQTT
-//  FIX: original code called resolve_uri_with_fallback() inside start() before
-//  IP was available — getaddrinfo() returned immediately with EAI_AGAIN and the
-//  URI fell back to the original string.  By deferring create() to on_ip_ready()
-//  we guarantee the network stack is ready before the hostname lookup.
-// ─────────────────────────────────────────────────────────────────────────────
-
 esp_err_t MQTTdispatcher::run() {
-    // ED_wifi::WiFiService::subscribeToIPReady takes void(*)(void)
-    // (signature changed per session notes from std::function to plain pointer)
     ED_wifi::WiFiService::subscribeToIPReady(on_ip_ready);
     ESP_LOGI(TAG, "run() — MQTT will start once IP is ready");
     return ESP_OK;
@@ -461,18 +509,16 @@ esp_err_t MQTTdispatcher::run() {
 
 void MQTTdispatcher::on_ip_ready() {
     ESP_LOGI(TAG, "IP ready — creating MQTT client");
-    s_mqtt = MqttClient::create(s_config);
+    s_mqtt = ED_MQTT::MqttClient::create(s_config);
     if (!s_mqtt) {
         ESP_LOGE(TAG, "MqttClient::create failed");
         return;
     }
     s_clHandle = s_mqtt->getHandle();
 
-    // Register dispatcher's own callbacks
     s_mqtt->registerConnectedCallback(on_mqtt_connected);
     s_mqtt->registerDataCallback(on_mqtt_data);
 
-    // Start the periodic info loop
     if (s_info_timer)
         xTimerStart(s_info_timer, 0);
 }
