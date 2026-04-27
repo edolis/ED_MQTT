@@ -9,7 +9,7 @@
 #include <esp_timer.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
-
+#include <freertos/semphr.h>
 
 #ifdef CONFIG_MQTT_PROTOCOL_5
 #include "mqtt5_client.h"
@@ -19,26 +19,30 @@ namespace ED_MQTT {
 
 static const char *TAG = "ED_MQTT";
 
+// ── Static mutex for thread safety (no dynamic allocation) ────────────────
+static StaticSemaphore_t s_mqtt_mutex_buffer;
+static SemaphoreHandle_t s_mqtt_mutex = nullptr;
+
+// Global initializer – runs before app_main, guarantees mutex exists.
+static bool init_mqtt_mutex() {
+    s_mqtt_mutex = xSemaphoreCreateRecursiveMutexStatic(&s_mqtt_mutex_buffer);
+    configASSERT(s_mqtt_mutex);
+    return true;
+}
+static bool _mqtt_mutex_initialized = init_mqtt_mutex();
+
 // ── Static member definitions
 // ─────────────────────────────────────────────────
-
-// FIX: raw pointer, not unique_ptr — singleton never freed, unique_ptr
-// destructor at program exit can cause issues with FreeRTOS still running.
 MqttClient *MqttClient::_instance = nullptr;
-
 esp_mqtt_client_config_t MqttClient::mqttConfig = {};
 
 // Callback tables
-MqttConnectedCallback MqttClient::connected_callbacks[MAX_CONNECTED_CALLBACKS] =
-    {};
+MqttConnectedCallback MqttClient::connected_callbacks[MAX_CONNECTED_CALLBACKS] = {};
 uint8_t MqttClient::connected_callback_count = 0;
 MqttDataCallback MqttClient::data_callbacks[MAX_DATA_CALLBACKS] = {};
 uint8_t MqttClient::data_callback_count = 0;
 
-// FIX: static payload buffer replaces std::string partialPayload.
-// std::string does malloc+reserve+append+clear on every message — over hours
-// this fragments the heap until the largest free block is too small for a new
-// MQTT session and the device reboots. Static buffer: zero runtime allocation.
+// Static payload buffer
 char MqttClient::s_payload_buf[MAX_MQTT_PAYLOAD] = {};
 size_t MqttClient::s_payload_len = 0;
 size_t MqttClient::s_payload_expected = 0;
@@ -53,29 +57,27 @@ QueueHandle_t MqttClient::reconnect_queue = nullptr;
 
 void MqttClient::reconnect_task(void *arg) {
   while (true) {
-    // Wait for a reconnect request (max 1 second timeout, but indefinite is
-    // fine)
     uint32_t dummy;
     if (xQueueReceive(reconnect_queue, &dummy, portMAX_DELAY) == pdTRUE) {
       ESP_LOGI(TAG, "Reconnect task: received request, starting MQTT client");
+
+      xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
       MqttClient *self = getInstance();
       if (self) {
-        // If client already exists, destroy it first to avoid "already exists"
-        // warning
         if (self->client) {
           ESP_LOGI(TAG, "Reconnect task: destroying existing client");
           self->destroyClient();
         }
-        esp_err_t err = self->start(mqttConfig); // use stored config
+        esp_err_t err = self->start(mqttConfig);
         if (err != ESP_OK) {
-          ESP_LOGE(TAG, "Reconnect task: start failed: %s",
-                   esp_err_to_name(err));
+          ESP_LOGE(TAG, "Reconnect task: start failed: %s", esp_err_to_name(err));
         } else {
           ESP_LOGI(TAG, "Reconnect task: MQTT started successfully");
         }
       } else {
         ESP_LOGE(TAG, "Reconnect task: no MQTT instance");
       }
+      xSemaphoreGiveRecursive(s_mqtt_mutex);
     }
   }
 }
@@ -92,33 +94,30 @@ const char *mqtt_event_names[] = {
 
 ESP_EVENT_DEFINE_BASE(ED_MQTT_SENSOR_EVENTS);
 
-// ── Registration
+// ── Registration (thread‑safe)
 // ──────────────────────────────────────────────────────────────
-
 void MqttClient::registerConnectedCallback(MqttConnectedCallback callback) {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   if (connected_callback_count < MAX_CONNECTED_CALLBACKS) {
     connected_callbacks[connected_callback_count++] = callback;
   } else {
-    ESP_LOGE(TAG, "registerConnectedCallback: table full (max %d)",
-             MAX_CONNECTED_CALLBACKS);
+    ESP_LOGE(TAG, "registerConnectedCallback: table full (max %d)", MAX_CONNECTED_CALLBACKS);
   }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
 }
 
 void MqttClient::registerDataCallback(MqttDataCallback callback) {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   if (data_callback_count < MAX_DATA_CALLBACKS) {
     data_callbacks[data_callback_count++] = callback;
   } else {
-    ESP_LOGE(TAG, "registerDataCallback: table full (max %d)",
-             MAX_DATA_CALLBACKS);
+    ESP_LOGE(TAG, "registerDataCallback: table full (max %d)", MAX_DATA_CALLBACKS);
   }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
 }
 
-// ── URI resolution
-// ──────────────────────────────────────────────────────────── IMPORTANT: call
-// this only after WiFi has an IP address (subscribe via
-// ED_wifi::WiFiService::subscribeToIPReady). Calling before IP is ready will
-// cause getaddrinfo() to block/fail and uri will be NULL → client_init crash.
-
+// ── URI resolution (no shared state, no mutex needed)
+// ────────────────────────────────────────────────────────────
 static char s_final_uri[128];
 
 static const char *resolve_uri_with_fallback(const char *uri_in) {
@@ -127,7 +126,7 @@ static const char *resolve_uri_with_fallback(const char *uri_in) {
 
   if (sscanf(uri_in, "%7[^:]://%63[^:]:%d", scheme, host, &port) < 2) {
     ESP_LOGE("ED_MQTT", "Invalid URI format: %s", uri_in);
-    return uri_in; // return original rather than NULL to avoid crash
+    return uri_in;
   }
 
   struct addrinfo *res = NULL;
@@ -144,15 +143,13 @@ static const char *resolve_uri_with_fallback(const char *uri_in) {
 
   if (getaddrinfo(host_local, NULL, NULL, &res) == 0 && res) {
     freeaddrinfo(res);
-    snprintf(s_final_uri, sizeof s_final_uri, "%s://%s:%d", scheme, host_local,
-             port);
+    snprintf(s_final_uri, sizeof s_final_uri, "%s://%s:%d", scheme, host_local, port);
     ESP_LOGI("ED_MQTT", "Resolved URI (mDNS): %s", s_final_uri);
     return s_final_uri;
   }
 
-  ESP_LOGE("ED_MQTT", "Both '%s' and '%s.local' failed — using original URI",
-           host, host);
-  return uri_in; // fall back to original, let MQTT retry
+  ESP_LOGE("ED_MQTT", "Both '%s' and '%s.local' failed — using original URI", host, host);
+  return uri_in;
 }
 
 // ── Default config
@@ -160,10 +157,8 @@ static const char *resolve_uri_with_fallback(const char *uri_in) {
 void MqttClient::setDefaultConfig() {
   static char topicBuf[64];
   static char msgBuf[64];
-  snprintf(topicBuf, sizeof topicBuf, "devices/connection/%s",
-           ED_SYS::ESP_std::Device::mqttName());
-  snprintf(msgBuf, sizeof msgBuf, "%s disconnected unexpectedly.",
-           ED_SYS::ESP_std::Device::mqttName());
+  snprintf(topicBuf, sizeof topicBuf, "devices/connection/%s", ED_SYS::ESP_std::Device::mqttName());
+  snprintf(msgBuf, sizeof msgBuf, "%s disconnected unexpectedly.", ED_SYS::ESP_std::Device::mqttName());
 
   mqttConfig = {};
   mqttConfig.broker.address.uri = "mqtts://192.168.1.220:8883";
@@ -181,43 +176,36 @@ void MqttClient::setDefaultConfig() {
   mqttConfig.session.protocol_ver = MQTT_PROTOCOL_V_5;
 }
 
-// ── Reconnect timer
+// ── Reconnect timer callback
 // ───────────────────────────────────────────────────────────
 void MqttClient::mqtt_reconnect_timer_cb(TimerHandle_t xTimer) {
   ESP_LOGI(TAG, "Reconnect timer fired – sending request to reconnect task");
   if (reconnect_queue) {
     uint32_t signal = 1;
-    xQueueSend(reconnect_queue, &signal, 0); // non-blocking
+    xQueueSend(reconnect_queue, &signal, 0);
   } else {
     ESP_LOGE(TAG, "Reconnect queue not ready, cannot request reconnect");
   }
 }
 
 // ── Teardown task
-// ───────────────────────────────────────────────────────────── FIX: original
-// code passed NULL as task arg then cast it to MqttClient*, causing an
-// immediate null-pointer dereference inside the task. We pass `this` explicitly
-// and use getInstance() as a fallback.
+// ─────────────────────────────────────────────────────────────
 void MqttClient::teardown_task(void *arg) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // arg is the MqttClient* that created the task — prefer it over
-    // getInstance() because getInstance() could be null during re-init
-    // sequences.
-    MqttClient *self =
-        (arg != nullptr) ? static_cast<MqttClient *>(arg) : getInstance();
+    xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
+    MqttClient *self = (arg != nullptr) ? static_cast<MqttClient *>(arg) : getInstance();
     if (self == nullptr) {
       ESP_LOGW(TAG, "teardown_task: no instance to tear down");
+      xSemaphoreGiveRecursive(s_mqtt_mutex);
       continue;
     }
     if (self->client) {
       ESP_LOGW(TAG, "Destroying MQTT client from safe task context");
-      esp_mqtt_client_stop(self->client);
-      esp_mqtt_client_destroy(self->client);
-      self->client = nullptr;
-      self->eventsRegistered = false;
+      self->destroyClient();
     }
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
   }
 }
 
@@ -225,22 +213,23 @@ void MqttClient::teardown_task(void *arg) {
 // ────────────────────────────────────────────────────────
 MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
   if (_instance != nullptr)
-    return _instance; // already created
+    return _instance;
+
+  // Mutex already exists from global initializer
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
 
   if (config != nullptr)
     mqttConfig = *config;
   else
     setDefaultConfig();
 
-  // Allocate instance once — this is the only heap allocation in this file
   _instance = new MqttClient();
   if (_instance == nullptr) {
     ESP_LOGE(TAG, "Failed to allocate MqttClient instance");
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     return nullptr;
   }
 
-  // FIX: pass `_instance` as task arg so teardown_task can dereference it
-  // safely. The original code passed NULL → instant crash inside the task.
   xTaskCreate(teardown_task, "mqtt_teardown", 4096,
               static_cast<void *>(_instance), tskIDLE_PRIORITY + 1,
               &teardown_task_handle);
@@ -254,13 +243,20 @@ MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
     }
     delete _instance;
     _instance = nullptr;
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     return nullptr;
   }
   setInstance(_instance);
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
   return _instance;
 }
 
-esp_mqtt_client_handle_t MqttClient::getHandle() { return client; }
+esp_mqtt_client_handle_t MqttClient::getHandle() {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
+  auto h = client;
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
+  return h;
+}
 
 // ── Event trampoline
 // ──────────────────────────────────────────────────────────
@@ -271,27 +267,34 @@ void MqttClient::mqtt_event_trampoline(void *handler_args,
   self->handleEvent(base, event_id, event_data);
 }
 
-// ── Start
+// ── Start (protected)
 // ─────────────────────────────────────────────────────────────────────
 esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
   ESP_LOGI(TAG, "MqttClient::start entered");
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
+
   if (client != nullptr) {
     ESP_LOGW(TAG, "client already exists");
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     return ESP_OK;
   }
+
   const char *uri = resolve_uri_with_fallback(config.broker.address.uri);
   config.broker.address.uri = uri;
   client = esp_mqtt_client_init(&config);
   if (client == nullptr) {
     ESP_LOGE(TAG, "esp_mqtt_client_init failed");
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     return ESP_FAIL;
   }
+
   ESP_LOGI(TAG, "MQTT client init OK");
   if (!eventsRegistered) {
     esp_err_t err = esp_mqtt_client_register_event(client, MQTT_EVENT_ANY,
                                                    mqtt_event_trampoline, this);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "register_event failed: %s", esp_err_to_name(err));
+      xSemaphoreGiveRecursive(s_mqtt_mutex);
       return err;
     }
     eventsRegistered = true;
@@ -299,6 +302,7 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
   }
   esp_err_t err = esp_mqtt_client_start(client);
   ESP_LOGI(TAG, "esp_mqtt_client_start returned: %s", esp_err_to_name(err));
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
   return err;
 }
 
@@ -306,9 +310,8 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
 // ─────────────────────────────────────────────────────────
 void MqttClient::scheduleReconnect(uint32_t delay_ms) {
   if (mqtt_reconnect_timer == nullptr) {
-    mqtt_reconnect_timer =
-        xTimerCreate("mqtt_reconnect", pdMS_TO_TICKS(delay_ms), pdFALSE,
-                     nullptr, mqtt_reconnect_timer_cb);
+    mqtt_reconnect_timer = xTimerCreate("mqtt_reconnect", pdMS_TO_TICKS(delay_ms), pdFALSE,
+                                        nullptr, mqtt_reconnect_timer_cb);
   } else {
     xTimerStop(mqtt_reconnect_timer, 0);
     xTimerChangePeriod(mqtt_reconnect_timer, pdMS_TO_TICKS(delay_ms), 0);
@@ -317,6 +320,7 @@ void MqttClient::scheduleReconnect(uint32_t delay_ms) {
 }
 
 bool MqttClient::isShortOutage() {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   int64_t now = esp_timer_get_time() / 1000000LL;
   int64_t since_last = now - last_disconnect_time;
   last_disconnect_time = now;
@@ -327,12 +331,15 @@ bool MqttClient::isShortOutage() {
 
   if (since_last > SHORT_WINDOW_SEC) {
     disconnect_count = 1;
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     return true;
   }
-  return (disconnect_count <= MAX_DISCONNECTS);
+  bool result = (disconnect_count <= MAX_DISCONNECTS);
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
+  return result;
 }
 
-// ── Event handler
+// ── Event handler (thread‑safe)
 // ─────────────────────────────────────────────────────────────
 void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                              void *event_data) {
@@ -347,18 +354,19 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
     esp_mqtt_client_publish(client, "/ESP_HANDSHAKE", "Hello from ESP32", 0,
                             MqttQoS::QOS1, 0);
 #endif
+    xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
     for (uint8_t i = 0; i < connected_callback_count; ++i) {
       if (connected_callbacks[i])
         connected_callbacks[i](event->client);
     }
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     break;
 
   case MQTT_EVENT_DISCONNECTED:
     if (isShortOutage()) {
       ESP_LOGW(TAG, "Transient disconnect — letting MQTT auto-reconnect");
     } else {
-      ESP_LOGE(TAG,
-               "Prolonged disconnect — tearing down and rebuilding client");
+      ESP_LOGE(TAG, "Prolonged disconnect — tearing down and rebuilding client");
       ED_heap_tracer::mqtt_heap_trace_snapshot_async();
       xTaskNotify(teardown_task_handle, 0, eNoAction);
       scheduleReconnect(3000);
@@ -372,8 +380,6 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                event->error_handle->error_type,
                event->error_handle->esp_tls_last_esp_err);
     }
-    // Only tear down on transport-level errors, not protocol errors.
-    // MQTT_ERROR_TYPE_TCP_TRANSPORT = 1
     if (event->error_handle &&
         event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
       ED_heap_tracer::mqtt_heap_trace_snapshot_async();
@@ -383,13 +389,9 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
     break;
 
   case MQTT_EVENT_DATA: {
-    // FIX: replaced std::string partialPayload (heap) with static char buffer.
-    // The old code did: partialPayload.reserve() + .append() + .clear() per
-    // message. Over thousands of messages this left the heap fragmented. Static
-    // buffer: one allocation at boot, reused forever.
+    xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
 
     if (event->current_data_offset == 0) {
-      // First (or only) chunk — reset assembly state
       s_payload_len = 0;
       s_payload_expected = event->total_data_len;
     }
@@ -400,13 +402,13 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                (unsigned)MAX_MQTT_PAYLOAD);
       s_payload_len = 0;
       s_payload_expected = 0;
+      xSemaphoreGiveRecursive(s_mqtt_mutex);
       break;
     }
 
     memcpy(s_payload_buf + s_payload_len, event->data, incoming);
     s_payload_len += incoming;
 
-    // Last chunk?
     bool complete = (s_payload_expected > 0)
                         ? (s_payload_len >= s_payload_expected)
                         : (event->current_data_offset + incoming >=
@@ -422,6 +424,7 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
       s_payload_len = 0;
       s_payload_expected = 0;
     }
+    xSemaphoreGiveRecursive(s_mqtt_mutex);
     break;
   }
 
@@ -449,7 +452,6 @@ int64_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
   if (count == 0)
     return -1;
 
-  // Fast path: up to 4 properties on the stack (covers 99% of cases)
   constexpr uint8_t STACK_THRESHOLD = 4;
   if (count <= STACK_THRESHOLD) {
     esp_mqtt5_user_property_item_t items[STACK_THRESHOLD];
@@ -463,7 +465,6 @@ int64_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
     return -1;
   }
 
-  // Slow path: >4 properties, heap-allocate (rare — broker-controlled)
   auto *items = static_cast<esp_mqtt5_user_property_item_t *>(
       malloc(sizeof(esp_mqtt5_user_property_item_t) * count));
   if (!items)
@@ -485,9 +486,10 @@ int64_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
 #endif
 }
 
-// ── Destructor / destroyClient
+// ── Destructor / destroyClient (thread‑safe)
 // ────────────────────────────────────────────────
 MqttClient::~MqttClient() {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   if (eventsRegistered && client) {
     esp_mqtt_client_unregister_event(client, MQTT_EVENT_ANY,
                                      mqtt_event_trampoline);
@@ -498,9 +500,11 @@ MqttClient::~MqttClient() {
     esp_mqtt_client_destroy(client);
     client = nullptr;
   }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
 }
 
 void MqttClient::destroyClient() {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   if (client) {
     ESP_LOGW(TAG, "destroyClient()");
     esp_mqtt_client_stop(client);
@@ -508,12 +512,13 @@ void MqttClient::destroyClient() {
     client = nullptr;
     eventsRegistered = false;
   }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
 }
 
 void MqttClient::setInstance(MqttClient *instance) {
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
   if (_instance == nullptr && instance != nullptr) {
     _instance = instance;
-    // Always create reconnect queue & task once (regardless of teardown task)
     if (reconnect_queue == nullptr) {
       reconnect_queue = xQueueCreate(5, sizeof(uint32_t));
       configASSERT(reconnect_queue);
@@ -522,49 +527,48 @@ void MqttClient::setInstance(MqttClient *instance) {
       xTaskCreate(reconnect_task, "mqtt_reconnect", 4096, nullptr,
                   tskIDLE_PRIORITY + 2, &reconnect_task_handle);
     }
-    // Create teardown task once
     if (teardown_task_handle == nullptr) {
       xTaskCreate(teardown_task, "mqtt_teardown", 4096,
                   static_cast<void *>(_instance), tskIDLE_PRIORITY + 1,
                   &teardown_task_handle);
     }
   }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
 }
 
 bool MqttClient::publish(const char* topic, const char* message, int qos, bool retain) {
-    if (client == nullptr) {
-        ESP_LOGE(TAG, "publish: MQTT client handle is null");
-        return false;
-    }
-    if (topic == nullptr || message == nullptr) {
-        ESP_LOGE(TAG, "publish: topic or message is null");
-        return false;
-    }
+  xSemaphoreTakeRecursive(s_mqtt_mutex, portMAX_DELAY);
+  bool ok = false;
+  if (client == nullptr) {
+    ESP_LOGE(TAG, "publish: MQTT client handle is null");
+  } else if (topic == nullptr || message == nullptr) {
+    ESP_LOGE(TAG, "publish: topic or message is null");
+  } else {
     int msg_id = esp_mqtt_client_publish(client, topic, message, 0, qos, retain ? 1 : 0);
     if (msg_id < 0) {
-        ESP_LOGE(TAG, "publish failed to '%s': error %d", topic, msg_id);
-        return false;
+      ESP_LOGE(TAG, "publish failed to '%s': error %d", topic, msg_id);
+    } else {
+      ESP_LOGD(TAG, "Published to '%s': %s (msg_id=%d)", topic, message, msg_id);
+      ok = true;
     }
-    ESP_LOGD(TAG, "Published to '%s': %s (msg_id=%d)", topic, message, msg_id);
-    return true;
+  }
+  xSemaphoreGiveRecursive(s_mqtt_mutex);
+  return ok;
 }
 
 // ── SAMPLE derived class
 // ──────────────────────────────────────────────────────
-// SAMPLE_derivedMqttClient *SAMPLE_derivedMqttClient::_instance = nullptr;
-
 esp_err_t SAMPLE_derivedMqttClient::create(esp_mqtt_client_config_t config) {
-     if (MqttClient::getInstance() != nullptr) return ESP_OK;
-    auto *inst = new SAMPLE_derivedMqttClient();
-    esp_err_t err = inst->start(config);
-    if (err != ESP_OK) {
-        delete inst;
-        return err;
-    }
-    MqttClient::setInstance(inst);
-    // THIS LINE FIXES THE RECONNECT CRASH:
-    MqttClient::mqttConfig = config;
-    return ESP_OK;
+  if (MqttClient::getInstance() != nullptr) return ESP_OK;
+  auto *inst = new SAMPLE_derivedMqttClient();
+  esp_err_t err = inst->start(config);
+  if (err != ESP_OK) {
+    delete inst;
+    return err;
+  }
+  MqttClient::setInstance(inst);
+  MqttClient::mqttConfig = config;
+  return ESP_OK;
 }
 
 void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
