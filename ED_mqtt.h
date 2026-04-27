@@ -60,21 +60,30 @@ public:
     /// Pass nullptr for config to use the built-in default from secrets.h.
     static MqttClient *create(esp_mqtt_client_config_t *config = nullptr);
 
+    /// Publish a message to a topic. Returns true on success, false on error.
+/// Uses the already connected MQTT client. No dynamic allocation.
+bool publish(const char* topic, const char* message, int qos = 1, bool retain = false);
+
     static MqttClient *getInstance() { return _instance; }
     esp_mqtt_client_handle_t getHandle();
     virtual ~MqttClient();
+    static void setInstance(MqttClient* instance);
 
     class MqttQoS {
     public:
         enum Value : int { QOS0 = 0, QOS1 = 1, QOS2 = 2 };
     };
+protected:
+    static esp_mqtt_client_config_t mqttConfig;
 
 private:
+static void reconnect_task(void *arg);
+static TaskHandle_t reconnect_task_handle;
+static QueueHandle_t reconnect_queue;
     static int64_t mqtt5_get_epoch_property(const esp_mqtt_event_t *event);
     static void    setDefaultConfig();
 
     // Internal config copy — set once at boot via setDefaultConfig() or create()
-    static esp_mqtt_client_config_t mqttConfig;
 
     // Static callback arrays — no heap
     static MqttConnectedCallback connected_callbacks[MAX_CONNECTED_CALLBACKS];
@@ -117,12 +126,12 @@ protected:
 class SAMPLE_derivedMqttClient : public MqttClient {
 private:
     bool eventsRegistered = false;
-    static SAMPLE_derivedMqttClient *_instance; // shadows base _instance
+    // static SAMPLE_derivedMqttClient *_instance; // shadows base _instance
 
 public:
     static esp_err_t create(esp_mqtt_client_config_t config);
-    void send_ping_message();
-    static SAMPLE_derivedMqttClient *getInstance() { return _instance; }
+    void send_ping_message(const char* message);
+    static SAMPLE_derivedMqttClient *getInstance() { return static_cast<SAMPLE_derivedMqttClient*>(MqttClient::getInstance()); }
 
 protected:
     void handleEvent(esp_event_base_t base, int32_t event_id,

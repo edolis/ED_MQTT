@@ -7,7 +7,9 @@
 #include "secrets.h"
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
+
 
 #ifdef CONFIG_MQTT_PROTOCOL_5
 #include "mqtt5_client.h"
@@ -46,6 +48,37 @@ int MqttClient::disconnect_count = 0;
 int64_t MqttClient::last_disconnect_time = 0;
 
 static TimerHandle_t mqtt_reconnect_timer = nullptr;
+TaskHandle_t MqttClient::reconnect_task_handle = nullptr;
+QueueHandle_t MqttClient::reconnect_queue = nullptr;
+
+void MqttClient::reconnect_task(void *arg) {
+  while (true) {
+    // Wait for a reconnect request (max 1 second timeout, but indefinite is
+    // fine)
+    uint32_t dummy;
+    if (xQueueReceive(reconnect_queue, &dummy, portMAX_DELAY) == pdTRUE) {
+      ESP_LOGI(TAG, "Reconnect task: received request, starting MQTT client");
+      MqttClient *self = getInstance();
+      if (self) {
+        // If client already exists, destroy it first to avoid "already exists"
+        // warning
+        if (self->client) {
+          ESP_LOGI(TAG, "Reconnect task: destroying existing client");
+          self->destroyClient();
+        }
+        esp_err_t err = self->start(mqttConfig); // use stored config
+        if (err != ESP_OK) {
+          ESP_LOGE(TAG, "Reconnect task: start failed: %s",
+                   esp_err_to_name(err));
+        } else {
+          ESP_LOGI(TAG, "Reconnect task: MQTT started successfully");
+        }
+      } else {
+        ESP_LOGE(TAG, "Reconnect task: no MQTT instance");
+      }
+    }
+  }
+}
 
 // ── Event name table
 // ──────────────────────────────────────────────────────────
@@ -151,14 +184,13 @@ void MqttClient::setDefaultConfig() {
 // ── Reconnect timer
 // ───────────────────────────────────────────────────────────
 void MqttClient::mqtt_reconnect_timer_cb(TimerHandle_t xTimer) {
-  ESP_LOGI(TAG, "Reconnect timer fired — restarting MQTT client");
-  // FIX: guard getInstance() — if teardown ran and instance is gone, do nothing
-  MqttClient *self = getInstance();
-  if (self == nullptr) {
-    ESP_LOGE(TAG, "mqtt_reconnect_timer_cb: instance is null, cannot restart");
-    return;
+  ESP_LOGI(TAG, "Reconnect timer fired – sending request to reconnect task");
+  if (reconnect_queue) {
+    uint32_t signal = 1;
+    xQueueSend(reconnect_queue, &signal, 0); // non-blocking
+  } else {
+    ESP_LOGE(TAG, "Reconnect queue not ready, cannot request reconnect");
   }
-  self->start(mqttConfig);
 }
 
 // ── Teardown task
@@ -224,7 +256,7 @@ MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
     _instance = nullptr;
     return nullptr;
   }
-
+  setInstance(_instance);
   return _instance;
 }
 
@@ -242,33 +274,32 @@ void MqttClient::mqtt_event_trampoline(void *handler_args,
 // ── Start
 // ─────────────────────────────────────────────────────────────────────
 esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
-  esp_err_t err;
-  if (client == nullptr) {
-    // Resolve hostname only if IP is available — caller must ensure this
-    const char *uri = resolve_uri_with_fallback(config.broker.address.uri);
-    config.broker.address.uri = uri;
-
-    ESP_LOGI(TAG, "Heap before mqtt_init: free=%u largest=%u",
-             heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-             heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-    ED_heap_tracer::mqtt_heap_trace_start();
-
-    client = esp_mqtt_client_init(&config);
-    if (client == nullptr)
-      return ESP_FAIL;
-    if (!eventsRegistered) {
-      err = esp_mqtt_client_register_event(client, MQTT_EVENT_ANY,
-                                           mqtt_event_trampoline, this);
-      if (err != ESP_OK)
-        return err;
-      eventsRegistered = true;
-    }
-    err = esp_mqtt_client_start(client);
-    if (err != ESP_OK)
-      return err;
+  ESP_LOGI(TAG, "MqttClient::start entered");
+  if (client != nullptr) {
+    ESP_LOGW(TAG, "client already exists");
+    return ESP_OK;
   }
-
-  return ESP_OK;
+  const char *uri = resolve_uri_with_fallback(config.broker.address.uri);
+  config.broker.address.uri = uri;
+  client = esp_mqtt_client_init(&config);
+  if (client == nullptr) {
+    ESP_LOGE(TAG, "esp_mqtt_client_init failed");
+    return ESP_FAIL;
+  }
+  ESP_LOGI(TAG, "MQTT client init OK");
+  if (!eventsRegistered) {
+    esp_err_t err = esp_mqtt_client_register_event(client, MQTT_EVENT_ANY,
+                                                   mqtt_event_trampoline, this);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "register_event failed: %s", esp_err_to_name(err));
+      return err;
+    }
+    eventsRegistered = true;
+    ESP_LOGI(TAG, "Events registered");
+  }
+  esp_err_t err = esp_mqtt_client_start(client);
+  ESP_LOGI(TAG, "esp_mqtt_client_start returned: %s", esp_err_to_name(err));
+  return err;
 }
 
 // ── Reconnect helpers
@@ -479,21 +510,61 @@ void MqttClient::destroyClient() {
   }
 }
 
+void MqttClient::setInstance(MqttClient *instance) {
+  if (_instance == nullptr && instance != nullptr) {
+    _instance = instance;
+    // Always create reconnect queue & task once (regardless of teardown task)
+    if (reconnect_queue == nullptr) {
+      reconnect_queue = xQueueCreate(5, sizeof(uint32_t));
+      configASSERT(reconnect_queue);
+    }
+    if (reconnect_task_handle == nullptr) {
+      xTaskCreate(reconnect_task, "mqtt_reconnect", 4096, nullptr,
+                  tskIDLE_PRIORITY + 2, &reconnect_task_handle);
+    }
+    // Create teardown task once
+    if (teardown_task_handle == nullptr) {
+      xTaskCreate(teardown_task, "mqtt_teardown", 4096,
+                  static_cast<void *>(_instance), tskIDLE_PRIORITY + 1,
+                  &teardown_task_handle);
+    }
+  }
+}
+
+bool MqttClient::publish(const char* topic, const char* message, int qos, bool retain) {
+    if (client == nullptr) {
+        ESP_LOGE(TAG, "publish: MQTT client handle is null");
+        return false;
+    }
+    if (topic == nullptr || message == nullptr) {
+        ESP_LOGE(TAG, "publish: topic or message is null");
+        return false;
+    }
+    int msg_id = esp_mqtt_client_publish(client, topic, message, 0, qos, retain ? 1 : 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "publish failed to '%s': error %d", topic, msg_id);
+        return false;
+    }
+    ESP_LOGD(TAG, "Published to '%s': %s (msg_id=%d)", topic, message, msg_id);
+    return true;
+}
+
 // ── SAMPLE derived class
 // ──────────────────────────────────────────────────────
-SAMPLE_derivedMqttClient *SAMPLE_derivedMqttClient::_instance = nullptr;
+// SAMPLE_derivedMqttClient *SAMPLE_derivedMqttClient::_instance = nullptr;
 
 esp_err_t SAMPLE_derivedMqttClient::create(esp_mqtt_client_config_t config) {
-  auto *inst = new SAMPLE_derivedMqttClient();
-  esp_err_t err = inst->start(config);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "SAMPLE_derivedMqttClient::create failed: %s",
-             esp_err_to_name(err));
-    delete inst;
-    return err;
-  }
-  _instance = inst;
-  return ESP_OK;
+     if (MqttClient::getInstance() != nullptr) return ESP_OK;
+    auto *inst = new SAMPLE_derivedMqttClient();
+    esp_err_t err = inst->start(config);
+    if (err != ESP_OK) {
+        delete inst;
+        return err;
+    }
+    MqttClient::setInstance(inst);
+    // THIS LINE FIXES THE RECONNECT CRASH:
+    MqttClient::mqttConfig = config;
+    return ESP_OK;
 }
 
 void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
@@ -513,15 +584,8 @@ void SAMPLE_derivedMqttClient::handleEvent(esp_event_base_t base,
   }
 }
 
-void SAMPLE_derivedMqttClient::send_ping_message() {
-  char msg[64];
-  if (client == nullptr) {
-    ESP_LOGE(TAG, "send_ping_message: MQTT client handle is null");
-    return;
-  }
-  snprintf(msg, sizeof msg, "%s:%lld", TAG, esp_timer_get_time() / 1000LL);
-  esp_mqtt_client_publish(client, "pingESPdevice", msg, 0, 1, 0);
-  ESP_LOGI(TAG, "Ping sent: %s", msg);
+void SAMPLE_derivedMqttClient::send_ping_message(const char *message) {
+  publish("IOT_DB/DIAG", message, 1, false);
 }
 
 } // namespace ED_MQTT
