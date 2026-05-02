@@ -12,7 +12,7 @@ idf_component_register(
         mbedtls
         diag
         ED_SYS
-        ED_JSON
+        ED_S_JSON
         ED_WIFI
 )
 

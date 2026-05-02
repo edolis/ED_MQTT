@@ -1,5 +1,5 @@
 #include "ED_MQTT_dispatcher.h"
-#include "ED_json.h"
+#include "ED_S_JSON.h"
 #include "ED_sys.h"
 #include "ED_wifi.h"
 #include "esp_log.h"
@@ -380,36 +380,68 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
 }
 
 void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/, int64_t cmdID) {
-    ED_JSON::JsonEncoder decoder(json);
-    if (!decoder.isValidJson()) return;
-
-    auto unwrapped = decoder.unwrapNestedArray();
-    if (unwrapped.isArray()) {
-        int sz = unwrapped.getArraySize();
-        for (int i = 0; i < sz; ++i) {
-            auto item = unwrapped.getArrayItem(i);
-            auto cmdOpt  = item.getString("cmd");
-            auto dataOpt = item.getString("data");
-            if (cmdOpt && dataOpt) {
-                const char *c = cmdOpt->c_str();
-                const char *d = dataOpt->c_str();
-                for (uint8_t j = 0; j < s_subscriber_count; ++j)
-                    if (s_subscribers[j])
-                        s_subscribers[j]->grabCommand(c, d, strlen(d), cmdID);
-            }
-        }
-    } else if (unwrapped.isValidJson()) {
-        auto cmdOpt  = unwrapped.getString("cmd");
-        auto dataOpt = unwrapped.getString("data");
-        if (cmdOpt && dataOpt) {
-            const char *c = cmdOpt->c_str();
-            const char *d = dataOpt->c_str();
+    // ----- Step 1: try as single object with "cmd" and "data" -----
+    ED_S_JSON::StaticJson decoder(json);
+    if (decoder.isValid()) {
+        const char *cmd = decoder.getString("cmd");
+        const char *data = decoder.getString("data");
+        if (cmd && data) {
             for (uint8_t i = 0; i < s_subscriber_count; ++i)
                 if (s_subscribers[i])
-                    s_subscribers[i]->grabCommand(c, d, strlen(d), cmdID);
+                    s_subscribers[i]->grabCommand(cmd, data, strlen(data), cmdID);
+            return;
         }
-    } else {
-        ESP_LOGW(TAG, "Malformed payload – not a command and not valid JSON");
+    }
+
+    // ----- Step 2: try as array of objects { "cmd":..., "data":... } -----
+    // Simple scan: find occurrences of "cmd":"...","data":"..." inside the JSON string.
+    // This avoids any parser functions that may be missing or incomplete.
+    const char *p = json;
+    while ((p = strstr(p, "\"cmd\"")) != nullptr) {
+        // Find the start of the command value
+        const char *cmd_start = strchr(p, ':');
+        if (!cmd_start) break;
+        cmd_start = strchr(cmd_start, '"');
+        if (!cmd_start) break;
+        cmd_start++; // first char of command string
+        const char *cmd_end = strchr(cmd_start, '"');
+        if (!cmd_end) break;
+
+        // Find "data" field after this "cmd"
+        const char *data_start = strstr(cmd_end, "\"data\"");
+        if (!data_start) break;
+        data_start = strchr(data_start, ':');
+        if (!data_start) break;
+        data_start = strchr(data_start, '"');
+        if (!data_start) break;
+        data_start++;
+        const char *data_end = strchr(data_start, '"');
+        if (!data_end) break;
+
+        // Extract command and data into local buffers
+        char cmd_buf[CMD_ID_LEN];
+        size_t cmd_len = cmd_end - cmd_start;
+        if (cmd_len >= sizeof(cmd_buf)) cmd_len = sizeof(cmd_buf) - 1;
+        strncpy(cmd_buf, cmd_start, cmd_len);
+        cmd_buf[cmd_len] = '\0';
+
+        char data_buf[256];
+        size_t data_len = data_end - data_start;
+        if (data_len >= sizeof(data_buf)) data_len = sizeof(data_buf) - 1;
+        strncpy(data_buf, data_start, data_len);
+        data_buf[data_len] = '\0';
+
+        // Dispatch
+        for (uint8_t i = 0; i < s_subscriber_count; ++i) {
+            if (s_subscribers[i])
+                s_subscribers[i]->grabCommand(cmd_buf, data_buf, data_len, cmdID);
+        }
+
+        // Move past this object (find the closing '}' and continue)
+        p = data_end + 1;
+        // Optionally skip to next ',' or '}'
+        while (*p && *p != ',' && *p != '}') ++p;
+        if (*p == ',') ++p;
     }
 }
 
