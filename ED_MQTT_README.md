@@ -8,6 +8,7 @@
 - TLS 1.2 secured using `esp_crt_bundle_attach` (no per‑device certificates).
 - **No `malloc` / `new`** after initialisation – all buffers and callback tables are static.
 - **Fully thread‑safe** using a statically allocated recursive mutex.
+- **Automatic recovery** – detects publish failures and reconnects transparently.
 - Provides a singleton `MqttClient` with static payload reassembly, eliminating `std::string` fragmentation.
 
 ---
@@ -20,6 +21,10 @@
 | TLS certificate verification | `esp_crt_bundle_attach` (bundle of public CAs) |
 | Last Will & Testament (LWT) | Configured with `retain=true`, QOS1 |
 | Connection recovery         | Automatic teardown+rebuild on prolonged disconnect |
+| **Publish failure detection** | Counts consecutive publish errors; reconnects after `MAX_CONSECUTIVE_FAILURES` (default 3) |
+| **Health monitor timer**    | Periodically checks publish failure counter; triggers reconnect if threshold exceeded |
+| **Forced reconnect API**    | `forceReconnect()` – safe to call from any task |
+| **Reconnect callback**      | Optional notification when library forces a reconnect |
 | Heap fragmentation prevention | Static payload buffer (4 KB), fixed callback arrays |
 | Thread safety               | Recursive mutex (static memory) protects all shared data |
 | mDNS hostname resolution    | Falls back to `<host>.local` automatically |
@@ -40,11 +45,14 @@ classDiagram
         +void registerConnectedCallback(cb)
         +void registerDataCallback(cb)
         +bool publish(topic, message, qos, retain)
+        +static void forceReconnect()
+        +static void registerReconnectCallback(cb)
         -esp_err_t start(config)
         -void destroyClient()
         -void handleEvent(base, id, data)
         -static void teardown_task(void*)
         -static void reconnect_task(void*)
+        -static void health_timer_cb(TimerHandle_t)
     }
 
     class Callbacks {
@@ -62,18 +70,17 @@ classDiagram
         +size_t s_payload_expected
     }
 
-    class ReconnectState {
+    class HealthMonitor {
         <<static>>
-        +TimerHandle_t reconnect_timer
-        +TaskHandle_t reconnect_task_handle
-        +QueueHandle_t reconnect_queue
-        +int disconnect_count
-        +int64_t last_disconnect_time
+        +TimerHandle_t s_health_timer
+        +uint8_t s_publish_fail_count
+        +ReconnectCallback s_reconnect_callback
+        +const uint8_t MAX_CONSECUTIVE_FAILURES = 3
     }
 
     MqttClient *-- Callbacks
     MqttClient *-- PayloadBuffer
-    MqttClient *-- ReconnectState
+    MqttClient *-- HealthMonitor
 ```
 
 ### Component Description
@@ -81,13 +88,13 @@ classDiagram
 - **MqttClient** – Main singleton class. Manages the underlying `esp_mqtt_client_handle_t`, event handling, and lifecycle.
 - **Callbacks** – Two static arrays storing user function pointers. Fixed size (max 4 each) – no heap.
 - **PayloadBuffer** – Static 4KB buffer used to reassemble multi‑fragment MQTT messages. Replaces `std::string` which caused fragmentation.
-- **ReconnectState** – Timer, task handle, queue, and counters for intelligent reconnect logic (short vs. long outages).
+- **HealthMonitor** – Periodic timer (30 sec) that checks `s_publish_fail_count`. If ≥3 consecutive publish failures, calls `forceReconnect()` and optionally invokes user callback.
 
 ---
 
 ## Thread Safety Model
 
-All shared resources are protected by a **recursive mutex** created statically (`StaticSemaphore_t`). The mutex is initialised before `app_main()`.
+All shared resources are protected by a **recursive mutex** created statically (`StaticSemaphore_t`). The mutex is lazily initialised on first use (after FreeRTOS scheduler starts).
 
 Protected resources:
 - `client` handle
@@ -95,8 +102,23 @@ Protected resources:
 - `connected_callbacks[]` and `connected_callback_count`
 - `data_callbacks[]` and `data_callback_count`
 - `disconnect_count`, `last_disconnect_time`
+- Health monitor counters
 
 Because the mutex is **recursive**, a callback registered with `registerDataCallback` can safely call `publish()` or `registerConnectedCallback()` without deadlock.
+
+---
+
+## Automatic Reconnection Logic
+
+The library **monitors publish failures internally** – no application code needed.
+
+- Every call to `publish()` that returns an error (e.g., `esp_mqtt_client_publish` returns <0) increments a static counter `s_publish_fail_count`.
+- A successful publish resets the counter to 0.
+- A **health timer** (period = 30 s) checks the counter. If `s_publish_fail_count >= MAX_CONSECUTIVE_FAILURES` (default 3), it calls `forceReconnect()`.
+- `forceReconnect()` stops the current MQTT client, notifies the teardown task, and schedules a reconnect after 1 s.
+- After reconnection, the client resumes normal operation.
+
+This mechanism **does not** use an idle timeout – reconnects only happen when publish operations actually fail.
 
 ---
 
@@ -123,17 +145,23 @@ void on_mqtt_data(esp_mqtt_client_handle_t client,
                   int64_t msgID) {
     ESP_LOGI("APP", "Received %.*s: %.*s", topic_len, topic, data_len, data);
 }
+
+void on_mqtt_reconnected() {
+    ESP_LOGI("APP", "MQTT auto-reconnected by library");
+    // Re-subscribe if needed
+}
 ```
 
 ### 3. Create and start MQTT client (after WiFi is ready)
 
 ```cpp
-// Usually inside a WiFi “IP ready” callback
+// Usually inside a WiFi "IP ready" callback
 void wifi_ready() {
     auto* mqtt = ED_MQTT::MqttClient::create();   // uses default config from secrets.h
     if (mqtt) {
         mqtt->registerConnectedCallback(on_mqtt_connected);
         mqtt->registerDataCallback(on_mqtt_data);
+        MqttClient::registerReconnectCallback(on_mqtt_reconnected); // optional
     }
 }
 ```
@@ -143,7 +171,11 @@ void wifi_ready() {
 ```cpp
 auto* mqtt = ED_MQTT::MqttClient::getInstance();
 if (mqtt) {
-    mqtt->publish("devices/status", "online", 1, true);
+    bool ok = mqtt->publish("devices/status", "online", 1, true);
+    if (!ok) {
+        // Library will automatically count the failure and may reconnect later.
+        // No action required here.
+    }
 }
 ```
 
@@ -158,13 +190,10 @@ cfg.credentials.authentication.password = "secret";
 auto* mqtt = ED_MQTT::MqttClient::create(&cfg);
 ```
 
-### 6. Using the sample derived class (reference)
+### 6. Force reconnect manually (if needed)
 
 ```cpp
-esp_mqtt_client_config_t cfg = {};
-ED_MQTT::SAMPLE_derivedMqttClient::create(cfg);
-auto* derived = ED_MQTT::SAMPLE_derivedMqttClient::getInstance();
-derived->send_ping_message("ping");
+MqttClient::forceReconnect();
 ```
 
 ---
@@ -178,7 +207,7 @@ static MqttClient* create(esp_mqtt_client_config_t* config = nullptr);
 ```
 
 Creates the singleton instance (if not already created) and starts the MQTT client.
-If `config` is `nullptr`, the built‑in default configuration is used (see `setDefaultConfig()`).
+If `config` is `nullptr`, the built‑in default configuration is used.
 Returns the instance pointer, or `nullptr` on failure.
 
 ### `MqttClient::getInstance()`
@@ -196,7 +225,7 @@ void registerConnectedCallback(MqttConnectedCallback callback);
 ```
 
 Registers a function to be called whenever the MQTT broker connection is established.
-Maximum 4 callbacks. The callback signature:
+Maximum 4 callbacks. Signature:
 
 ```cpp
 void (*)(esp_mqtt_client_handle_t client);
@@ -208,8 +237,8 @@ void (*)(esp_mqtt_client_handle_t client);
 void registerDataCallback(MqttDataCallback callback);
 ```
 
-Registers a function to be called for every fully reassembled incoming MQTT message.
-Maximum 4 callbacks. The callback signature:
+Registers a function for every fully reassembled incoming MQTT message.
+Max 4 callbacks. Signature:
 
 ```cpp
 void (*)(esp_mqtt_client_handle_t client,
@@ -218,8 +247,8 @@ void (*)(esp_mqtt_client_handle_t client,
          int64_t msgID);
 ```
 
-**Note:** `topic` is **not** null‑terminated – use `topicLen`.
-`data` points into the static reassembly buffer and is valid **only during the callback** – copy it if needed later.
+**Note:** `topic` is not null‑terminated – use `topicLen`.
+`data` points into a static buffer, valid only during the callback – copy it if needed later.
 
 ### `publish()`
 
@@ -227,8 +256,25 @@ void (*)(esp_mqtt_client_handle_t client,
 bool publish(const char* topic, const char* message, int qos = 1, bool retain = false);
 ```
 
-Publishes a message to the MQTT broker. Returns `true` on success, `false` on error (e.g., client not connected).
-The method is thread‑safe and uses the recursive mutex.
+Publishes a message. Returns `true` on success, `false` on error.
+**Automatic failure counting**: each failure increments an internal counter; a successful publish resets it. The health monitor triggers reconnect after 3 consecutive failures.
+
+### `forceReconnect()`
+
+```cpp
+static void forceReconnect();
+```
+
+Immediately tears down the current MQTT client and schedules a reconnect after 1 second. Safe to call from any task. Used internally by the health monitor; can also be called by user code.
+
+### `registerReconnectCallback()`
+
+```cpp
+using ReconnectCallback = void (*)(void);
+static void registerReconnectCallback(ReconnectCallback cb);
+```
+
+Registers a function that will be called **when the library forces a reconnect** (i.e., after 3 consecutive publish failures). Optional – can be used to re‑subscribe to topics or log the event.
 
 ### `getHandle()`
 
@@ -255,54 +301,41 @@ The default configuration (used when `create(nullptr)` is called) is defined in 
 | LWT QoS / Retain         | QOS1 / `true` |
 | Protocol version         | MQTT 5.0 |
 
-To use a different broker or credentials, pass your own `esp_mqtt_client_config_t` to `create()`.
+### Health monitor constants (compile‑time)
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `MAX_CONSECUTIVE_FAILURES` | 3 | Number of publish failures before forcing reconnect |
+| `HEALTH_CHECK_PERIOD_MS` | 30000 ms | Timer interval to check failure counter |
+
+These can be adjusted by modifying the class constants in `ED_mqtt.h`.
 
 ---
 
 ## Important Notes
 
 ### 1. Heap allocation – only at boot
-- The single `MqttClient` instance is allocated with `new` in `create()`. This is **the only** heap allocation in the library.
-- No further allocations happen during runtime: no `std::string`, no `std::function`, no dynamic containers.
+- The single `MqttClient` instance is allocated with `new` in `create()`. This is **the only** heap allocation.
+- No runtime allocations: no `std::string`, no `std::function`, no dynamic containers.
 
 ### 2. Payload size limit
-Maximum reassembled MQTT payload is `MAX_MQTT_PAYLOAD` (default 4096 bytes). Larger messages are logged and dropped.
+Maximum reassembled MQTT payload is `MAX_MQTT_PAYLOAD` (default 4096 bytes). Larger messages are dropped.
 
 ### 3. Callback maximums
 - Connected callbacks: max 4
 - Data callbacks: max 4
-These limits are compile‑time constants and can be increased by editing the header.
+These limits are compile‑time constants.
 
-### 4. Thread safety requirements
-The library uses a **recursive mutex**. You can call any public method from any FreeRTOS task, including from inside a callback. However, avoid holding the mutex for long periods (e.g., slow I/O inside a data callback) – it will block other tasks from using MQTT.
+### 4. Thread safety
+The library uses a **recursive mutex**. You can call any public method from any FreeRTOS task, including from inside a callback. Avoid long critical sections.
 
-### 5. DNS / mDNS resolution
-`resolve_uri_with_fallback()` is called automatically when starting the client. If the hostname does not resolve directly, it appends `.local` and retries (for mDNS). This function blocks until resolution completes – ensure WiFi has an IP address before calling `create()`.
+### 5. Automatic reconnect behaviour
+- On **publish failure**: library increments counter. After 3 consecutive failures, it forces a rebuild of the client.
+- On **MQTT disconnect events**: existing `isShortOutage()` logic decides whether to rebuild (long outage) or let auto‑reconnect handle it.
+- On **transport errors**: same as prolonged disconnect → rebuild.
 
-### 6. Reconnect behaviour
-- **Short outage** (frequent short disconnects, <60s between them): the library lets the underlying MQTT stack auto‑reconnect.
-- **Prolonged outage** (disconnects spaced >60s, or 3+ short disconnects): the client is fully destroyed and rebuilt, which cleans up stale TCP/TLS state.
-
-### 7. Teardown and reconnect tasks
-Two internal FreeRTOS tasks are created:
-- `mqtt_teardown` – destroys the client from a safe context (avoids recursive event loop issues).
-- `mqtt_reconnect` – waits on a queue and restarts the client after a delay.
-
-Both are created only once and never deleted.
-
----
-
-## Building and Dependencies
-
-- ESP‑IDF v5.5 or later
-- Component `ED_SYS` (provides `ED_SYS::ESP_std::Device::mqttName()`)
-- Component `ED_wifi` (optional, but recommended to wait for IP before creating MQTT)
-- Header `secrets.h` must define:
-  ```cpp
-  #define ED_MQTT_USERNAME "your_username"
-  #define ED_MQTT_PASSWORD "your_password"
-  ```
-- Set `CONFIG_MQTT_PROTOCOL_5=y` in `sdkconfig` to enable MQTT 5.0 features.
+### 6. mDNS / DNS resolution
+`resolve_uri_with_fallback()` is called automatically. If hostname does not resolve, it appends `.local` (mDNS) and retries. Call `create()` only after WiFi IP is obtained.
 
 ---
 
@@ -310,11 +343,12 @@ Both are created only once and never deleted.
 
 | Symptom | Likely cause | Solution |
 |---------|--------------|----------|
-| `assert failed: xQueueTakeMutexRecursive` | Mutex not initialised before use | Ensure you are using the corrected code where `init_mqtt_mutex()` runs at global scope. |
-| Payload incomplete / corrupted | Multiple `MQTT_EVENT_DATA` fragments not reassembled correctly | Check that the static buffer is protected by the mutex (it is in the provided code). |
-| Heap fragmentation increases slowly | Some component still uses dynamic allocation | Verify that `ESP_LOGD` logs do not allocate; disable `DEBUG_BUILD` if needed. |
-| MQTT fails to connect with `-1` | DNS resolution blocks or fails | Call `create()` only after WiFi IP is obtained – subscribe to `ED_wifi` “IP ready” event. |
-| Repeated reconnects every few seconds | Short outage detection threshold too low | Adjust `MAX_DISCONNECTS` or `SHORT_WINDOW_SEC` in `isShortOutage()`. |
+| `undefined reference to mqtt_reconnect_timer` | Static timer not defined in `.cpp` | Add `TimerHandle_t MqttClient::mqtt_reconnect_timer = nullptr;` in `.cpp` |
+| `identifier "ReconnectCallback" is undefined` | Missing scope resolution | Use `MqttClient::ReconnectCallback` inside `.cpp` |
+| No automatic reconnect on publish failures | Health timer not started | Check `setInstance()` starts the timer; ensure `MAX_CONSECUTIVE_FAILURES` not too large |
+| `forceReconnect()` has no effect | Teardown task not created | Verify `teardown_task_handle` is set in `setInstance()` |
+| Payload incomplete | Multi‑fragment message not reassembled | Static buffer is protected by mutex – should work; enable `ESP_LOGV` for MQTT events |
+| Heap fragmentation slowly increases | Some component still allocates | Disable `DEBUG_BUILD`; check third‑party libraries |
 
 ---
 
@@ -323,7 +357,7 @@ Both are created only once and never deleted.
 | File | Description |
 |------|-------------|
 | `ED_mqtt.h` | Public API, callback types, class declaration |
-| `ED_mqtt.cpp` | Implementation with static mutex, payload buffer, reconnect logic |
+| `ED_mqtt.cpp` | Implementation with static mutex, payload buffer, health monitor, reconnect logic |
 | `secrets.h` (user provided) | Username and password for MQTT broker |
 
 ---
@@ -334,5 +368,5 @@ Same as the parent project (proprietary / internal). Adjust as needed.
 
 ---
 
-*Documentation version 1.0 – for ED_MQTT component*
+*Documentation version 2.0 – for ED_MQTT component with auto‑reconnect on publish failures*
 ```
