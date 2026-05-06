@@ -34,6 +34,16 @@ static SemaphoreHandle_t get_mqtt_mutex() {
 
 // ── Static member definitions
 // ─────────────────────────────────────────────────
+
+// Static timer for reconnection (was previously a file‑static variable)
+TimerHandle_t MqttClient::mqtt_reconnect_timer = nullptr;
+
+// Health monitor static members
+TimerHandle_t MqttClient::s_health_timer = nullptr;
+uint8_t MqttClient::s_publish_fail_count = 0;
+MqttClient::ReconnectCallback MqttClient::s_reconnect_callback = nullptr;
+
+
 MqttClient *MqttClient::_instance = nullptr;
 esp_mqtt_client_config_t MqttClient::mqttConfig = {};
 
@@ -320,6 +330,18 @@ void MqttClient::scheduleReconnect(uint32_t delay_ms) {
   xTimerStart(mqtt_reconnect_timer, 0);
 }
 
+void MqttClient::health_timer_cb(TimerHandle_t xTimer) {
+    if (s_publish_fail_count >= MAX_CONSECUTIVE_FAILURES) {
+        ESP_LOGW(TAG, "%u consecutive publish failures, forcing reconnect",
+                 s_publish_fail_count);
+        forceReconnect();
+        s_publish_fail_count = 0;
+        if (s_reconnect_callback) {
+            s_reconnect_callback();
+        }
+    }
+}
+
 bool MqttClient::isShortOutage() {
   xSemaphoreTakeRecursive(get_mqtt_mutex(), portMAX_DELAY);
   int64_t now = esp_timer_get_time() / 1000000LL;
@@ -534,27 +556,63 @@ void MqttClient::setInstance(MqttClient *instance) {
                   &teardown_task_handle);
     }
   }
+  if (s_health_timer == nullptr) {
+    s_health_timer = xTimerCreate("mqtt_health",
+                                   pdMS_TO_TICKS(30000),  // check every 30 sec
+                                   pdTRUE,
+                                   nullptr,
+                                   health_timer_cb);
+    if (s_health_timer) {
+        xTimerStart(s_health_timer, 0);
+        ESP_LOGI(TAG, "Health monitor started (30s interval)");
+    }
+}
   xSemaphoreGiveRecursive(get_mqtt_mutex());
 }
 
 bool MqttClient::publish(const char* topic, const char* message, int qos, bool retain) {
-  xSemaphoreTakeRecursive(get_mqtt_mutex(), portMAX_DELAY);
-  bool ok = false;
-  if (client == nullptr) {
-    ESP_LOGE(TAG, "publish: MQTT client handle is null");
-  } else if (topic == nullptr || message == nullptr) {
-    ESP_LOGE(TAG, "publish: topic or message is null");
-  } else {
-    int msg_id = esp_mqtt_client_publish(client, topic, message, 0, qos, retain ? 1 : 0);
-    if (msg_id < 0) {
-      ESP_LOGE(TAG, "publish failed to '%s': error %d", topic, msg_id);
+    xSemaphoreTakeRecursive(get_mqtt_mutex(), portMAX_DELAY);
+    bool ok = false;
+    if (client == nullptr) {
+        ESP_LOGE(TAG, "publish: MQTT client handle is null");
+    } else if (topic == nullptr || message == nullptr) {
+        ESP_LOGE(TAG, "publish: topic or message is null");
     } else {
-      ESP_LOGD(TAG, "Published to '%s': %s (msg_id=%d)", topic, message, msg_id);
-      ok = true;
+        int msg_id = esp_mqtt_client_publish(client, topic, message, 0, qos, retain ? 1 : 0);
+        if (msg_id < 0) {
+            ESP_LOGE(TAG, "publish failed to '%s': error %d", topic, msg_id);
+            s_publish_fail_count++;                     // ← failure counter
+        } else {
+            ESP_LOGD(TAG, "Published to '%s': %s (msg_id=%d)", topic, message, msg_id);
+            s_publish_fail_count = 0;                   // ← reset on success
+            ok = true;
+        }
     }
-  }
-  xSemaphoreGiveRecursive(get_mqtt_mutex());
-  return ok;
+    xSemaphoreGiveRecursive(get_mqtt_mutex());
+    return ok;
+}
+
+void MqttClient::forceReconnect() {
+    ESP_LOGW(TAG, "forceReconnect() called – tearing down and rebuilding client");
+    // Take mutex to safely access teardown_task_handle and scheduleReconnect
+    xSemaphoreTakeRecursive(get_mqtt_mutex(), portMAX_DELAY);
+    if (teardown_task_handle) {
+        xTaskNotify(teardown_task_handle, 0, eNoAction);
+    }
+    // Schedule reconnect after 1 second (same logic as prolonged disconnect)
+    if (mqtt_reconnect_timer == nullptr) {
+        mqtt_reconnect_timer = xTimerCreate("mqtt_reconnect", pdMS_TO_TICKS(1000), pdFALSE,
+                                            nullptr, mqtt_reconnect_timer_cb);
+    } else {
+        xTimerStop(mqtt_reconnect_timer, 0);
+        xTimerChangePeriod(mqtt_reconnect_timer, pdMS_TO_TICKS(1000), 0);
+    }
+    xTimerStart(mqtt_reconnect_timer, 0);
+    xSemaphoreGiveRecursive(get_mqtt_mutex());
+}
+
+void MqttClient::registerReconnectCallback(ReconnectCallback cb) {
+    s_reconnect_callback = cb;
 }
 
 // ── SAMPLE derived class
