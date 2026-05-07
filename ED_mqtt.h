@@ -131,7 +131,7 @@ private:
   static void setDefaultConfig();
   void destroyClient();
   bool isShortOutage();
-  void scheduleReconnect(uint32_t delay_ms);
+  static void scheduleReconnect(uint32_t delay_ms);
 
   // Event handling
   bool eventsRegistered = false;

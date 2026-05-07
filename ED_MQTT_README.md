@@ -7,7 +7,7 @@
 - Based on ESP‑IDF’s `esp-mqtt` with MQTT 5.0 support.
 - TLS 1.2 secured using `esp_crt_bundle_attach` (no per‑device certificates).
 - **No `malloc` / `new`** after initialisation – all buffers and callback tables are static.
-- **Fully thread‑safe** using a statically allocated recursive mutex.
+- **Fully thread‑safe** using a statically allocated non‑recursive mutex.
 - **Automatic recovery** – detects publish failures and reconnects transparently.
 - Provides a singleton `MqttClient` with static payload reassembly, eliminating `std::string` fragmentation.
 
@@ -20,13 +20,13 @@
 | MQTT 5.0 protocol           | Enabled via `CONFIG_MQTT_PROTOCOL_5` |
 | TLS certificate verification | `esp_crt_bundle_attach` (bundle of public CAs) |
 | Last Will & Testament (LWT) | Configured with `retain=true`, QOS1 |
-| Connection recovery         | Automatic teardown+rebuild on prolonged disconnect |
+| Connection recovery         | Automatic teardown+rebuild on prolonged disconnect or publish failures |
 | **Publish failure detection** | Counts consecutive publish errors; reconnects after `MAX_CONSECUTIVE_FAILURES` (default 3) |
-| **Health monitor timer**    | Periodically checks publish failure counter; triggers reconnect if threshold exceeded |
+| **Health monitor timer**    | Periodically checks publish failure counter; triggers `forceReconnect()` if threshold exceeded |
 | **Forced reconnect API**    | `forceReconnect()` – safe to call from any task |
 | **Reconnect callback**      | Optional notification when library forces a reconnect |
 | Heap fragmentation prevention | Static payload buffer (4 KB), fixed callback arrays |
-| Thread safety               | Recursive mutex (static memory) protects all shared data |
+| Thread safety               | Non‑recursive mutex (static memory) protects all shared data; careful lock ordering prevents deadlocks |
 | mDNS hostname resolution    | Falls back to `<host>.local` automatically |
 
 ---
@@ -78,9 +78,18 @@ classDiagram
         +const uint8_t MAX_CONSECUTIVE_FAILURES = 3
     }
 
+    class ReconnectMachine {
+        <<static>>
+        +TimerHandle_t mqtt_reconnect_timer
+        +TaskHandle_t reconnect_task_handle
+        +QueueHandle_t reconnect_queue
+        +TaskHandle_t teardown_task_handle
+    }
+
     MqttClient *-- Callbacks
     MqttClient *-- PayloadBuffer
     MqttClient *-- HealthMonitor
+    MqttClient *-- ReconnectMachine
 ```
 
 ### Component Description
@@ -89,12 +98,13 @@ classDiagram
 - **Callbacks** – Two static arrays storing user function pointers. Fixed size (max 4 each) – no heap.
 - **PayloadBuffer** – Static 4KB buffer used to reassemble multi‑fragment MQTT messages. Replaces `std::string` which caused fragmentation.
 - **HealthMonitor** – Periodic timer (30 sec) that checks `s_publish_fail_count`. If ≥3 consecutive publish failures, calls `forceReconnect()` and optionally invokes user callback.
+- **ReconnectMachine** – Manages teardown task, reconnect task, and a timer to orchestrate reconnection after a disconnection or failure. Ensures that the MQTT client is destroyed safely before being recreated.
 
 ---
 
 ## Thread Safety Model
 
-All shared resources are protected by a **recursive mutex** created statically (`StaticSemaphore_t`). The mutex is lazily initialised on first use (after FreeRTOS scheduler starts).
+All shared resources are protected by a **non‑recursive mutex** created statically (`StaticSemaphore_t`). The mutex is lazily initialised on first use (after FreeRTOS scheduler starts).
 
 Protected resources:
 - `client` handle
@@ -104,21 +114,38 @@ Protected resources:
 - `disconnect_count`, `last_disconnect_time`
 - Health monitor counters
 
-Because the mutex is **recursive**, a callback registered with `registerDataCallback` can safely call `publish()` or `registerConnectedCallback()` without deadlock.
+Important locking rules:
+- The mutex is **non‑recursive** – it cannot be taken twice by the same task. All code paths are carefully designed to avoid nested locking.
+- `destroyClient()` must be called with the mutex already held.
+- `start()` must be called with the mutex already held.
+- The teardown task releases the mutex **before** destroying the underlying MQTT client to avoid deadlocks during event callbacks.
+- `reconnect_task` uses a 2‑second timeout when taking the mutex to prevent blocking forever.
 
 ---
 
 ## Automatic Reconnection Logic
 
-The library **monitors publish failures internally** – no application code needed.
+The library monitors both **disconnection events** and **publish failures** internally – no application code needed.
 
-- Every call to `publish()` that returns an error (e.g., `esp_mqtt_client_publish` returns <0) increments a static counter `s_publish_fail_count`.
+### Publish failure detection
+- Every call to `publish()` that returns an error increments a static counter `s_publish_fail_count`.
 - A successful publish resets the counter to 0.
 - A **health timer** (period = 30 s) checks the counter. If `s_publish_fail_count >= MAX_CONSECUTIVE_FAILURES` (default 3), it calls `forceReconnect()`.
-- `forceReconnect()` stops the current MQTT client, notifies the teardown task, and schedules a reconnect after 1 s.
-- After reconnection, the client resumes normal operation.
 
-This mechanism **does not** use an idle timeout – reconnects only happen when publish operations actually fail.
+### Disconnection handling
+- When `MQTT_EVENT_DISCONNECTED` or a transport error occurs, the library evaluates `isShortOutage()`.
+- If the disconnect is considered **prolonged** (after 3 disconnects within 60 seconds), it schedules a teardown and rebuild.
+- Otherwise, the underlying `esp-mqtt` stack is allowed to autoreconnect automatically.
+
+### Teardown and rebuild process
+1. `forceReconnect()` (or the event handler) notifies the `teardown_task`.
+2. The teardown task takes the mutex, copies the client handle, clears the pointer, releases the mutex, then stops and destroys the client.
+3. A timer (`mqtt_reconnect_timer`) is started with a short delay (1000 ms for manual force, 3000 ms for disconnects, 5000 ms for transport errors).
+4. When the timer expires, a signal is sent to the `reconnect_task` queue.
+5. `reconnect_task` takes the mutex, destroys any remaining client (just in case), and calls `start()` to re‑initialise the MQTT client.
+6. After successful `start()`, the connection is re‑established and normal operation resumes.
+
+This mechanism does **not** use an idle timeout – reconnects only happen when publish operations actually fail or when a genuine disconnect/error occurs.
 
 ---
 
@@ -327,12 +354,12 @@ Maximum reassembled MQTT payload is `MAX_MQTT_PAYLOAD` (default 4096 bytes). Lar
 These limits are compile‑time constants.
 
 ### 4. Thread safety
-The library uses a **recursive mutex**. You can call any public method from any FreeRTOS task, including from inside a callback. Avoid long critical sections.
+The library uses a **non‑recursive mutex**. Do not call `publish()` or other methods that take the mutex from inside a callback that is already holding the mutex (the callbacks themselves are invoked without the mutex held, so it is safe). The health timer and reconnect callbacks run in different contexts and are safe.
 
 ### 5. Automatic reconnect behaviour
-- On **publish failure**: library increments counter. After 3 consecutive failures, it forces a rebuild of the client.
-- On **MQTT disconnect events**: existing `isShortOutage()` logic decides whether to rebuild (long outage) or let auto‑reconnect handle it.
-- On **transport errors**: same as prolonged disconnect → rebuild.
+- **Publish failure**: library increments counter. After 3 consecutive failures, it forces a rebuild of the client.
+- **MQTT disconnect events**: the `isShortOutage()` logic decides whether to rebuild (long outage) or let auto‑reconnect handle it (short outage).
+- **Transport errors**: same as prolonged disconnect → rebuild.
 
 ### 6. mDNS / DNS resolution
 `resolve_uri_with_fallback()` is called automatically. If hostname does not resolve, it appends `.local` (mDNS) and retries. Call `create()` only after WiFi IP is obtained.
@@ -343,12 +370,11 @@ The library uses a **recursive mutex**. You can call any public method from any 
 
 | Symptom | Likely cause | Solution |
 |---------|--------------|----------|
-| `undefined reference to mqtt_reconnect_timer` | Static timer not defined in `.cpp` | Add `TimerHandle_t MqttClient::mqtt_reconnect_timer = nullptr;` in `.cpp` |
-| `identifier "ReconnectCallback" is undefined` | Missing scope resolution | Use `MqttClient::ReconnectCallback` inside `.cpp` |
-| No automatic reconnect on publish failures | Health timer not started | Check `setInstance()` starts the timer; ensure `MAX_CONSECUTIVE_FAILURES` not too large |
-| `forceReconnect()` has no effect | Teardown task not created | Verify `teardown_task_handle` is set in `setInstance()` |
-| Payload incomplete | Multi‑fragment message not reassembled | Static buffer is protected by mutex – should work; enable `ESP_LOGV` for MQTT events |
-| Heap fragmentation slowly increases | Some component still allocates | Disable `DEBUG_BUILD`; check third‑party libraries |
+| No reconnect after broker restart | Mutex held by teardown task | Ensure `teardown_task` releases mutex before destroying client (fixed in latest code). |
+| `Failed to take mutex after 2 seconds` | Another task still holds mutex | Check for long‑running operations under mutex (e.g., slow callbacks). |
+| Auto‑reconnect never triggers | Health timer not started | Verify `setInstance()` creates and starts `s_health_timer`. |
+| Payload incomplete | Multi‑fragment message not reassembled | Static buffer is protected by mutex – should work; enable `ESP_LOGV` for MQTT events. |
+| Heap fragmentation slowly increases | Some component still allocates | Disable `DEBUG_BUILD`; check third‑party libraries. |
 
 ---
 
@@ -368,5 +394,5 @@ Same as the parent project (proprietary / internal). Adjust as needed.
 
 ---
 
-*Documentation version 2.0 – for ED_MQTT component with auto‑reconnect on publish failures*
+*Documentation version 3.0 – for ED_MQTT with non‑recursive mutex and automatic reconnect on publish failures*
 ```
