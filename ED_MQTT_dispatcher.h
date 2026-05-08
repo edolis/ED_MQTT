@@ -3,19 +3,20 @@
 #include "ED_mqtt.h"
 #include "freertos/timers.h"
 #include "secrets.h"
+#include "ED_S_JSON.h"   // <-- ADDED: needed for JsonFieldProvider
 
 namespace ED_MQTT_dispatcher {
 
 // ── Compile-time limits ───────────────────────────────────────────────
 static constexpr uint8_t MAX_COMMANDS        = 16;
-static constexpr uint8_t MAX_OPT_PARAMS      = 8;   // one slot for _msgID, one for _original
+static constexpr uint8_t MAX_OPT_PARAMS      = 8;
 static constexpr uint8_t MAX_CMD_SUBSCRIBERS = 4;
 static constexpr uint8_t MAX_REGISTRIES      = 8;
 
 static constexpr uint8_t CMD_ID_LEN          = 16;
 static constexpr uint8_t CMD_DEX_LEN         = 64;
 static constexpr uint8_t PARAM_KEY_LEN       = 16;
-static constexpr uint8_t PARAM_VAL_LEN       = 64;  // must fit full command string
+static constexpr uint8_t PARAM_VAL_LEN       = 64;
 
 // ── CmdParam ─────────────────────────────────────────────────────────
 struct CmdParam {
@@ -28,7 +29,7 @@ struct ctrlCommand {
     enum class cmdScope { LOCALONLY, GLOBAL };
 
     char        cmdID[CMD_ID_LEN] = {};
-    const char* cmdDex = nullptr;          // brief description (in Flash)
+    const char* cmdDex = nullptr;
     cmdScope    scope = cmdScope::LOCALONLY;
 
     CmdParam    optParam[MAX_OPT_PARAMS] = {};
@@ -66,7 +67,7 @@ public:
     virtual ~iCommandRunner() = default;
 };
 
-// ── CommandWithRegistry (implements iCommandRunner) ─────────────────
+// ── CommandWithRegistry ──────────────────────────────────────────────
 class CommandWithRegistry : public iCommandRunner {
 public:
     CommandRegistry registry;
@@ -82,9 +83,9 @@ public:
 
 // ── RegistryInfo (for GlobalCommandRegistry) ────────────────────────
 struct RegistryInfo {
-    const char* regID;               // e.g., "DIAG"
+    const char* regID;
     CommandRegistry* registry;
-    const char* briefDesc;           // e.g., "Diagnostic commands"
+    const char* briefDesc;
 };
 
 // ── GlobalCommandRegistry (singleton) ───────────────────────────────
@@ -92,15 +93,8 @@ class GlobalCommandRegistry {
 public:
     static GlobalCommandRegistry& instance();
 
-    // Must be called once before any help or registry registration.
     void setBaseUrl(const char* url);
-
-    // Register a registry (base URL is used automatically)
-    bool registerRegistry(const char* regID,
-                          CommandRegistry* reg,
-                          const char* briefDesc = nullptr);
-
-    // Three help levels (all use the base URL)
+    bool registerRegistry(const char* regID, CommandRegistry* reg, const char* briefDesc = nullptr);
     void getHelpOverview(char* buf, size_t len) const;
     void getRegistryHelp(const char* regID, char* buf, size_t len) const;
     void getCommandHelp(const char* regID, const char* cmdID, char* buf, size_t len) const;
@@ -118,6 +112,10 @@ private:
 class MQTTdispatcher {
 public:
     enum ackType { OK, FAIL };
+
+    // --- JSON field provider type and registration ---
+    using JsonFieldProvider = void (*)(ED_S_JSON::StaticJson& json);
+    static void registerJsonFieldProvider(JsonFieldProvider provider);
 
     static esp_err_t initialize(esp_mqtt_client_config_t* config = nullptr);
     static esp_err_t run();
@@ -143,6 +141,7 @@ private:
     static void publishInfo();
     static void handleCommandObject(const char* json, size_t jsonLen, int64_t cmdID);
 
+    // --- Static members ---
     static iCommandRunner* s_subscribers[MAX_CMD_SUBSCRIBERS];
     static uint8_t         s_subscriber_count;
     static esp_mqtt_client_handle_t s_clHandle;
@@ -151,6 +150,11 @@ private:
     static char            s_mqtt_id[18];
     static ED_MQTT::MqttClient*   s_mqtt;
     static esp_mqtt_client_config_t* s_config;
+
+    // --- JSON provider storage ---
+    static constexpr uint8_t MAX_JSON_PROVIDERS = 8;
+    static JsonFieldProvider s_json_providers[MAX_JSON_PROVIDERS];
+    static uint8_t           s_json_provider_count;
 };
 
 } // namespace ED_MQTT_dispatcher
