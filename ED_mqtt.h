@@ -12,7 +12,8 @@ namespace ED_MQTT {
  *
  * TLS notes:
  *  - Broker sends its server cert (signed by CA), NOT the CA cert.
- *  - Verification via esp_crt_bundle_attach (no per-device certificate storage).
+ *  - Verification via esp_crt_bundle_attach (no per-device certificate
+ * storage).
  *  - CONFIG_MQTT_PROTOCOL_5=y required in sdkconfig for MQTT5.
  *
  * Allocation policy (required for indefinite runtime):
@@ -111,7 +112,8 @@ private:
   static void reconnect_task(void *arg);
   static TaskHandle_t reconnect_task_handle;
   static QueueHandle_t reconnect_queue;
-  static TimerHandle_t mqtt_reconnect_timer;   // not static in original, but made static for clarity
+  static TimerHandle_t mqtt_reconnect_timer; // not static in original, but made
+                                             // static for clarity
   static void mqtt_reconnect_timer_cb(TimerHandle_t xTimer);
 
   // Teardown task
@@ -125,6 +127,10 @@ private:
   static constexpr uint8_t MAX_CONSECUTIVE_FAILURES = 3;
   static constexpr TickType_t HEALTH_CHECK_PERIOD_MS = pdMS_TO_TICKS(30000);
   static ReconnectCallback s_reconnect_callback;
+
+#ifdef CONFIG_MQTT_PROTOCOL_5
+  static mqtt5_user_property_handle_t s_publish_property;
+#endif
 
   // Internal helpers
   static int64_t mqtt5_get_epoch_property(const esp_mqtt_event_t *event);

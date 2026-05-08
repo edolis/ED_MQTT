@@ -1,3 +1,4 @@
+```markdown
 # ED_MQTT Library Documentation
 
 ## Overview
@@ -9,6 +10,7 @@
 - **No `malloc` / `new`** after initialisation – all buffers and callback tables are static.
 - **Fully thread‑safe** using a statically allocated non‑recursive mutex.
 - **Automatic recovery** – detects publish failures and reconnects transparently.
+- **MQTT5 user property** – automatically adds `client-id` to every publish for debugging.
 - Provides a singleton `MqttClient` with static payload reassembly, eliminating `std::string` fragmentation.
 
 ---
@@ -25,9 +27,27 @@
 | **Health monitor timer**    | Periodically checks publish failure counter; triggers `forceReconnect()` if threshold exceeded |
 | **Forced reconnect API**    | `forceReconnect()` – safe to call from any task |
 | **Reconnect callback**      | Optional notification when library forces a reconnect |
+| **MQTT5 user property**     | `client-id` automatically added to every publish message (for device identification) |
 | Heap fragmentation prevention | Static payload buffer (4 KB), fixed callback arrays |
 | Thread safety               | Non‑recursive mutex (static memory) protects all shared data; careful lock ordering prevents deadlocks |
 | mDNS hostname resolution    | Falls back to `<host>.local` automatically |
+
+---
+
+## Important: TLS Certificate Name Matching
+
+When using TLS (`mqtts://`), the **broker URI hostname must exactly match** the Common Name (CN) or a Subject Alternative Name (SAN) present in the server’s certificate. If your certificate is issued for `raspi00`, you **must** use `mqtts://raspi00:8883`. Using an IP address (`192.168.1.220`) will cause a TLS certificate name mismatch and the connection will fail.
+
+The default broker URI shown in `setDefaultConfig()` (`mqtts://192.168.1.220:8883`) is just a **placeholder example**; do not use it unless your certificate is valid for that IP. Always override the configuration with your own URI that matches your certificate.
+
+Example of correct configuration for a certificate with CN `raspi00`:
+
+```cpp
+esp_mqtt_client_config_t mqtt_cfg = {};
+mqtt_cfg.broker.address.uri = "mqtts://raspi00:8883";
+// ... other settings
+MqttClient::create(&mqtt_cfg);
+```
 
 ---
 
@@ -86,10 +106,16 @@ classDiagram
         +TaskHandle_t teardown_task_handle
     }
 
+    class MQTT5Props {
+        <<static>>
+        +mqtt5_user_property_handle_t s_publish_property
+    }
+
     MqttClient *-- Callbacks
     MqttClient *-- PayloadBuffer
     MqttClient *-- HealthMonitor
     MqttClient *-- ReconnectMachine
+    MqttClient *-- MQTT5Props
 ```
 
 ### Component Description
@@ -99,6 +125,7 @@ classDiagram
 - **PayloadBuffer** – Static 4KB buffer used to reassemble multi‑fragment MQTT messages. Replaces `std::string` which caused fragmentation.
 - **HealthMonitor** – Periodic timer (30 sec) that checks `s_publish_fail_count`. If ≥3 consecutive publish failures, calls `forceReconnect()` and optionally invokes user callback.
 - **ReconnectMachine** – Manages teardown task, reconnect task, and a timer to orchestrate reconnection after a disconnection or failure. Ensures that the MQTT client is destroyed safely before being recreated.
+- **MQTT5Props** – Holds a user property handle that adds a `client-id` property to every outgoing publish message. The value is the device's MQTT client ID (as set in the configuration). This allows the broker to identify the source of each message.
 
 ---
 
@@ -113,6 +140,7 @@ Protected resources:
 - `data_callbacks[]` and `data_callback_count`
 - `disconnect_count`, `last_disconnect_time`
 - Health monitor counters
+- MQTT5 property handle (read/update)
 
 Important locking rules:
 - The mutex is **non‑recursive** – it cannot be taken twice by the same task. All code paths are carefully designed to avoid nested locking.
@@ -149,6 +177,25 @@ This mechanism does **not** use an idle timeout – reconnects only happen when 
 
 ---
 
+## MQTT5 User Property: `client-id`
+
+When MQTT5 is enabled (`CONFIG_MQTT_PROTOCOL_5=y`), the library **automatically** attaches a user property `client-id` to every outgoing publish message. The value is the client ID of the device (as configured in `mqttConfig.credentials.client_id`). This is extremely useful for debugging on the broker side – you can see exactly which device sent a message, even if you are not subscribed to the `$SYS` topics.
+
+**How it works:**
+- At client initialisation, a user property handle is created once.
+- Before each `publish()`, the handle is attached to the publish packet using `esp_mqtt5_client_set_publish_property()`.
+- The broker (or any subscriber that inspects user properties) will see a property with key `client-id` and the device’s client ID as the value.
+
+**Example (MQTT subscriber with verbose output – Mosquitto):**
+
+```text
+Client mosq-sub received PUBLISH (d0, q1, r0, m1, 'sensors/temp', ... (10 bytes), client-id=ESP_32_97_54)
+```
+
+**No action is required from your application** – this is completely transparent.
+
+---
+
 ## Usage Example
 
 ### 1. Include headers
@@ -181,10 +228,19 @@ void on_mqtt_reconnected() {
 
 ### 3. Create and start MQTT client (after WiFi is ready)
 
+**Important:** The broker URI **must** match the certificate’s CN/SAN. Example for a certificate valid for `raspi00`:
+
 ```cpp
-// Usually inside a WiFi "IP ready" callback
 void wifi_ready() {
-    auto* mqtt = ED_MQTT::MqttClient::create();   // uses default config from secrets.h
+    // Create a configuration with the correct hostname
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = "mqtts://raspi00:8883";
+    mqtt_cfg.credentials.username = ED_MQTT_USERNAME;
+    mqtt_cfg.credentials.authentication.password = ED_MQTT_PASSWORD;
+    mqtt_cfg.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
+    // ... set other fields as needed (last will, etc.)
+
+    auto* mqtt = MqttClient::create(&mqtt_cfg);
     if (mqtt) {
         mqtt->registerConnectedCallback(on_mqtt_connected);
         mqtt->registerDataCallback(on_mqtt_data);
@@ -193,31 +249,19 @@ void wifi_ready() {
 }
 ```
 
-### 4. Publish a message
+If you prefer to use the library’s default configuration, you **must** change the hardcoded IP address in `setDefaultConfig()` to match your certificate, or always pass your own config as above.
+
+### 4. Publish a message (client‑id property will be added automatically)
 
 ```cpp
 auto* mqtt = ED_MQTT::MqttClient::getInstance();
 if (mqtt) {
     bool ok = mqtt->publish("devices/status", "online", 1, true);
-    if (!ok) {
-        // Library will automatically count the failure and may reconnect later.
-        // No action required here.
-    }
+    // The published message will include user property: client-id=<device_name>
 }
 ```
 
-### 5. Custom configuration (instead of default)
-
-```cpp
-esp_mqtt_client_config_t cfg = {};
-cfg.broker.address.uri = "mqtts://mybroker.local:8883";
-cfg.credentials.username = "device1";
-cfg.credentials.authentication.password = "secret";
-// ... other fields
-auto* mqtt = ED_MQTT::MqttClient::create(&cfg);
-```
-
-### 6. Force reconnect manually (if needed)
+### 5. Force reconnect manually (if needed)
 
 ```cpp
 MqttClient::forceReconnect();
@@ -234,8 +278,10 @@ static MqttClient* create(esp_mqtt_client_config_t* config = nullptr);
 ```
 
 Creates the singleton instance (if not already created) and starts the MQTT client.
-If `config` is `nullptr`, the built‑in default configuration is used.
+If `config` is `nullptr`, the built‑in default configuration is used (see `setDefaultConfig()`).
 Returns the instance pointer, or `nullptr` on failure.
+
+**Note:** The default configuration contains a placeholder IP address (`192.168.1.220`). For TLS to work, the URI hostname must match your server certificate – always provide your own `config` unless you have modified the default.
 
 ### `MqttClient::getInstance()`
 
@@ -285,6 +331,7 @@ bool publish(const char* topic, const char* message, int qos = 1, bool retain = 
 
 Publishes a message. Returns `true` on success, `false` on error.
 **Automatic failure counting**: each failure increments an internal counter; a successful publish resets it. The health monitor triggers reconnect after 3 consecutive failures.
+**MQTT5 user property**: If MQTT5 is enabled, a `client-id` property is automatically attached to every publish.
 
 ### `forceReconnect()`
 
@@ -317,8 +364,8 @@ Returns the underlying `esp_mqtt_client_handle_t` for advanced operations (e.g.,
 
 The default configuration (used when `create(nullptr)` is called) is defined in `MqttClient::setDefaultConfig()`:
 
-| Parameter                | Value |
-|--------------------------|-------|
+| Parameter                | Value (placeholder) |
+|--------------------------|---------------------|
 | Broker URI               | `mqtts://192.168.1.220:8883` |
 | CA verification          | `esp_crt_bundle_attach` (system CA bundle) |
 | Username / Password      | From `secrets.h` (`ED_MQTT_USERNAME`, `ED_MQTT_PASSWORD`) |
@@ -327,6 +374,8 @@ The default configuration (used when `create(nullptr)` is called) is defined in 
 | Last Will message        | `<client_id> disconnected unexpectedly.` |
 | LWT QoS / Retain         | QOS1 / `true` |
 | Protocol version         | MQTT 5.0 |
+
+**⚠️ Critical:** The default URI uses an IP address. If your broker certificate expects a hostname (e.g., `raspi00`), you **must** override the configuration when calling `create()`. Using the default IP with a certificate that only contains `raspi00` will cause a TLS handshake failure (certificate name mismatch).
 
 ### Health monitor constants (compile‑time)
 
@@ -370,6 +419,7 @@ The library uses a **non‑recursive mutex**. Do not call `publish()` or other m
 
 | Symptom | Likely cause | Solution |
 |---------|--------------|----------|
+| TLS handshake error (certificate name mismatch) | Broker URI hostname does not match certificate CN/SAN | Ensure the URI (`mqtts://hostname`) exactly matches the name in your certificate. |
 | No reconnect after broker restart | Mutex held by teardown task | Ensure `teardown_task` releases mutex before destroying client (fixed in latest code). |
 | `Failed to take mutex after 2 seconds` | Another task still holds mutex | Check for long‑running operations under mutex (e.g., slow callbacks). |
 | Auto‑reconnect never triggers | Health timer not started | Verify `setInstance()` creates and starts `s_health_timer`. |
@@ -383,7 +433,7 @@ The library uses a **non‑recursive mutex**. Do not call `publish()` or other m
 | File | Description |
 |------|-------------|
 | `ED_mqtt.h` | Public API, callback types, class declaration |
-| `ED_mqtt.cpp` | Implementation with static mutex, payload buffer, health monitor, reconnect logic |
+| `ED_mqtt.cpp` | Implementation with static mutex, payload buffer, health monitor, reconnect logic, MQTT5 user property |
 | `secrets.h` (user provided) | Username and password for MQTT broker |
 
 ---
@@ -394,5 +444,5 @@ Same as the parent project (proprietary / internal). Adjust as needed.
 
 ---
 
-*Documentation version 3.0 – for ED_MQTT with non‑recursive mutex and automatic reconnect on publish failures*
+*Documentation version 3.2 – for ED_MQTT with non‑recursive mutex, automatic reconnect, MQTT5 client‑id user property, and TLS name‑matching clarification*
 ```
