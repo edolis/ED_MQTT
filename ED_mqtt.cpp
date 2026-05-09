@@ -445,6 +445,14 @@ void MqttClient::destroyClient() {
     esp_mqtt_client_handle_t old = client;
     client = nullptr;
     eventsRegistered = false;
+
+#ifdef CONFIG_MQTT_PROTOCOL_5
+    if (s_publish_property) {
+        esp_mqtt5_client_delete_user_property(s_publish_property);
+        s_publish_property = nullptr;
+    }
+#endif
+
     xSemaphoreGive(mutex);
 
     if (old) {
@@ -480,10 +488,9 @@ void MqttClient::setInstance(MqttClient *instance) {
 bool MqttClient::publish(const char *topic, const char *message, int qos, bool retain) {
     SemaphoreHandle_t mutex = get_mqtt_mutex();
     xSemaphoreTake(mutex, portMAX_DELAY);
-    esp_mqtt_client_handle_t cl = client;   // copy under lock
-    xSemaphoreGive(mutex);
-
+    esp_mqtt_client_handle_t cl = client;
     if (!cl) {
+        xSemaphoreGive(mutex);
         ESP_LOGE(TAG, "publish: client is null");
         return false;
     }
@@ -500,18 +507,14 @@ bool MqttClient::publish(const char *topic, const char *message, int qos, bool r
         }
     }
 #endif
-        int msg_id = esp_mqtt_client_publish(cl, topic, message, 0, qos, retain ? 1 : 0);
-    {
-        SemaphoreHandle_t mutex = get_mqtt_mutex();
-        xSemaphoreTake(mutex, portMAX_DELAY);
-        if (msg_id >= 0) {
-            s_publish_fail_count = 0;
-            ok = true;
-        } else {
-            s_publish_fail_count++;
-        }
-        xSemaphoreGive(mutex);
+    int msg_id = esp_mqtt_client_publish(cl, topic, message, 0, qos, retain ? 1 : 0);
+    if (msg_id >= 0) {
+        s_publish_fail_count = 0;
+        ok = true;
+    } else {
+        s_publish_fail_count++;
     }
+    xSemaphoreGive(mutex);
     return ok;
 }
 
