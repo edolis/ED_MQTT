@@ -18,6 +18,7 @@ static constexpr uint8_t CMD_DEX_LEN         = 64;
 static constexpr uint8_t PARAM_KEY_LEN       = 16;
 static constexpr uint8_t PARAM_VAL_LEN       = 64;
 
+
 // ── CmdParam ─────────────────────────────────────────────────────────
 struct CmdParam {
     char key[PARAM_KEY_LEN];
@@ -111,6 +112,8 @@ private:
 // ── MQTTdispatcher ──────────────────────────────────────────────────
 class MQTTdispatcher {
 public:
+
+    static esp_mqtt_client_handle_t getClientHandle();
     enum ackType { OK, FAIL };
 
     // --- JSON field provider type and registration ---
@@ -123,7 +126,12 @@ public:
     static void ackCommand(int64_t reqMsgID, const char* commandID,
                            ackType ackResult, const char* originalCommand);
 
+    // --- Timer control (used by PFREQ) ---
+    static TimerHandle_t s_info_timer;   // make accessible
+
 private:
+static char s_cached_ip[16];   // enough for IPv4
+
     static void on_mqtt_connected(esp_mqtt_client_handle_t client);
     static void on_mqtt_data(esp_mqtt_client_handle_t client,
                              const char* topic, int topicLen,
@@ -146,7 +154,7 @@ private:
     static uint8_t         s_subscriber_count;
     static esp_mqtt_client_handle_t s_clHandle;
     static TaskHandle_t    s_info_task_handle;
-    static TimerHandle_t   s_info_timer;
+    // s_info_timer is now public (declared above)
     static char            s_mqtt_id[18];
     static ED_MQTT::MqttClient*   s_mqtt;
     static esp_mqtt_client_config_t* s_config;

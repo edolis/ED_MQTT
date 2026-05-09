@@ -6,7 +6,6 @@
 #include <cctype>
 #include <cstring>
 
-
 static StaticSemaphore_t s_disp_mutex_buffer;
 static SemaphoreHandle_t s_disp_mutex = nullptr;
 
@@ -17,6 +16,7 @@ static SemaphoreHandle_t get_disp_mutex() {
     }
     return s_disp_mutex;
 }
+
 namespace ED_MQTT_dispatcher {
 
 static const char *TAG = "MQTTdisp";
@@ -34,6 +34,7 @@ esp_mqtt_client_config_t *MQTTdispatcher::s_config = nullptr;
 MQTTdispatcher::JsonFieldProvider
     MQTTdispatcher::s_json_providers[MAX_JSON_PROVIDERS] = {};
 uint8_t MQTTdispatcher::s_json_provider_count = 0;
+char MQTTdispatcher::s_cached_ip[16] = "";
 
 //-------------------------------------------------------------
 
@@ -314,6 +315,15 @@ void GlobalCommandRegistry::getCommandHelp(const char *regID, const char *cmdID,
 }
 
 // ── MQTTdispatcher implementation ────────────────────────────────────
+
+esp_mqtt_client_handle_t MQTTdispatcher::getClientHandle() {
+    SemaphoreHandle_t mutex = get_disp_mutex();
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    esp_mqtt_client_handle_t cl = s_clHandle;
+    xSemaphoreGive(mutex);
+    return cl;
+}
+
 void MQTTdispatcher::subscribe(iCommandRunner *subscriber) {
   if (s_subscriber_count >= MAX_CMD_SUBSCRIBERS) {
     ESP_LOGE(TAG, "subscriber table full (max %d)", MAX_CMD_SUBSCRIBERS);
@@ -387,7 +397,6 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
   build_ping_json(info_buf, sizeof info_buf);
   esp_mqtt_client_publish(client, topic_info, info_buf, strlen(info_buf),
                           ED_MQTT::MqttClient::MqttQoS::QOS1, true);
-
 }
 
 void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
@@ -426,7 +435,81 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
             return;
         }
 
-        // Normal colon command
+        // ── PFREQ command: configure periodic ping interval ────────
+        if (strcmp(cmdID, "PFREQ") == 0) {
+            const char *arg = payload_buf;
+            while (*arg && isspace((unsigned char)*arg)) ++arg;
+
+            bool disable = false;
+            TickType_t new_period_ticks = 0;
+
+            if (*arg == 'D' || *arg == 'd') {
+                disable = true;
+            } else {
+                int number = 0;
+                if (sscanf(arg, "%d", &number) == 1) {
+                    if (number == 0) {
+                        disable = true;
+                    } else {
+                        // move past digits
+                        while (*arg && isdigit((unsigned char)*arg)) ++arg;
+                        unsigned long multiplier = 1;   // default = seconds
+                        char ch = *arg;
+                        if (ch == 's' || ch == 'S') {
+                            ++arg;
+                        } else if (ch == 'm' || ch == 'M') {
+                            multiplier = 60;
+                            ++arg;
+                        } else if (ch == 'h' || ch == 'H') {
+                            multiplier = 3600;
+                            ++arg;
+                        } else if (ch == 'd' || ch == 'D') {
+                            multiplier = 86400;
+                            ++arg;
+                        }
+                        unsigned long total_sec = (unsigned long)number * multiplier;
+                        new_period_ticks = pdMS_TO_TICKS(total_sec * 1000);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "PFREQ: Invalid argument '%s'", arg);
+                    return;
+                }
+            }
+
+            if (s_info_timer) {
+                if (disable) {
+                    if (xTimerStop(s_info_timer, 0) == pdPASS) {
+                        ESP_LOGI(TAG, "PFREQ: Periodic ping disabled");
+                        if (s_clHandle) {
+                            esp_mqtt_client_publish(s_clHandle, "ack", "Ping disabled", 0, 0, 0);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "PFREQ: Failed to stop timer");
+                    }
+                } else {
+                    if (xTimerChangePeriod(s_info_timer, new_period_ticks, 0) == pdPASS) {
+                        ESP_LOGI(TAG, "PFREQ: Ping interval changed to %lu ms",
+                                 (unsigned long)(new_period_ticks * portTICK_PERIOD_MS));
+                        // ensure timer is running
+                        xTimerStart(s_info_timer, 0);
+                        if (s_clHandle) {
+                            char ack_msg[64];
+                            snprintf(ack_msg, sizeof(ack_msg),
+                                     "Ping interval set to %lu ms",
+                                     (unsigned long)(new_period_ticks * portTICK_PERIOD_MS));
+                            esp_mqtt_client_publish(s_clHandle, "ack", ack_msg, 0, 0, 0);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "PFREQ: Failed to change timer period");
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "PFREQ: Info timer not initialised");
+            }
+            return;   // command handled, don’t pass to subscribers
+        }
+
+        // Normal colon command – dispatch to subscribers
         ESP_LOGD(TAG, "Subscriber count: %d", s_subscriber_count);
         for (uint8_t i = 0; i < s_subscriber_count; ++i) {
             if (s_subscribers[i]) {
@@ -465,77 +548,53 @@ void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
   }
 
   // ----- Step 2: try as array of objects { "cmd":..., "data":... } -----
-  // Simple scan: find occurrences of "cmd":"...","data":"..." inside the JSON
-  // string. This avoids any parser functions that may be missing or incomplete.
   const char *p = json;
   while ((p = strstr(p, "\"cmd\"")) != nullptr) {
-    // Find the start of the command value
     const char *cmd_start = strchr(p, ':');
-    if (!cmd_start)
-      break;
+    if (!cmd_start) break;
     cmd_start = strchr(cmd_start, '"');
-    if (!cmd_start)
-      break;
-    cmd_start++; // first char of command string
+    if (!cmd_start) break;
+    cmd_start++;
     const char *cmd_end = strchr(cmd_start, '"');
-    if (!cmd_end)
-      break;
+    if (!cmd_end) break;
 
-    // Find "data" field after this "cmd"
     const char *data_start = strstr(cmd_end, "\"data\"");
-    if (!data_start)
-      break;
+    if (!data_start) break;
     data_start = strchr(data_start, ':');
-    if (!data_start)
-      break;
+    if (!data_start) break;
     data_start = strchr(data_start, '"');
-    if (!data_start)
-      break;
+    if (!data_start) break;
     data_start++;
     const char *data_end = strchr(data_start, '"');
-    if (!data_end)
-      break;
+    if (!data_end) break;
 
-    // Extract command and data into local buffers
     char cmd_buf[CMD_ID_LEN];
     size_t cmd_len = cmd_end - cmd_start;
-    if (cmd_len >= sizeof(cmd_buf))
-      cmd_len = sizeof(cmd_buf) - 1;
+    if (cmd_len >= sizeof(cmd_buf)) cmd_len = sizeof(cmd_buf) - 1;
     strncpy(cmd_buf, cmd_start, cmd_len);
     cmd_buf[cmd_len] = '\0';
 
     char data_buf[256];
     size_t data_len = data_end - data_start;
-    if (data_len >= sizeof(data_buf))
-      data_len = sizeof(data_buf) - 1;
+    if (data_len >= sizeof(data_buf)) data_len = sizeof(data_buf) - 1;
     strncpy(data_buf, data_start, data_len);
     data_buf[data_len] = '\0';
 
-    // Dispatch
     for (uint8_t i = 0; i < s_subscriber_count; ++i) {
       if (s_subscribers[i])
         s_subscribers[i]->grabCommand(cmd_buf, data_buf, data_len, cmdID);
     }
 
-    // Move past this object (find the closing '}' and continue)
     p = data_end + 1;
-    // Optionally skip to next ',' or '}'
-    while (*p && *p != ',' && *p != '}')
-      ++p;
-    if (*p == ',')
-      ++p;
+    while (*p && *p != ',' && *p != '}') ++p;
+    if (*p == ',') ++p;
   }
 }
 
 void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
                                 ackType ackResult, const char *originalCommand) {
-    SemaphoreHandle_t mutex = get_disp_mutex();
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    esp_mqtt_client_handle_t cl = s_clHandle;
-    xSemaphoreGive(mutex);
-
-    if (!cl) {
-        ESP_LOGW(TAG, "ackCommand: no client handle");
+    if (!s_mqtt) {
+        ESP_LOGW(TAG, "ackCommand: MQTT client not available");
         return;
     }
 
@@ -548,44 +607,46 @@ void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
 
     char ackbuf[256];
     const char *display = (originalCommand && originalCommand[0]) ? originalCommand : commandID;
-    int n = snprintf(ackbuf, sizeof ackbuf, "[%s] %s", display ? display : "?",
+    int n = snprintf(ackbuf, sizeof ackbuf, "[%s] %s",
+                     display ? display : "?",
                      ackResult == ackType::OK ? "OK" : "FAIL");
     if (n < 0) n = 0;
     if (n >= (int)sizeof ackbuf) n = (int)sizeof ackbuf - 1;
 
-    esp_mqtt_client_publish(cl, topic_ack, ackbuf, n,
-                            ED_MQTT::MqttClient::MqttQoS::QOS1, false);
+    bool ok = s_mqtt->publish(topic_ack, ackbuf, 1, false);   // QoS1, not retained
+    if (!ok) {
+        ESP_LOGE(TAG, "ackCommand publish failed");
+    }
 }
 
 void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
-  // --- Base fields (always present) ---
-  ED_S_JSON::StaticJson json;
-  json.beginObject();
+    const char *mqttId   = ED_SYS::ESP_std::Device::mqttName();
+    const char *mac      = ED_SYS::ESP_std::Device::stdMAC();
+    const char *ip       = s_cached_ip[0] ? s_cached_ip : "0.0.0.0";
+    const char *uptime   = ED_SYS::ESP_std::Runtime::uptime();
+    unsigned long uptime_sec = (unsigned long)(esp_timer_get_time() / 1000000LL);
 
-  json.addString("StationID", ED_SYS::ESP_std::Device::mqttName());
-  json.addString("MAC", ED_SYS::ESP_std::Device::stdMAC());
-  json.addString("IP", ED_SYS::ESP_std::Device::curIP());
-  json.addString("location", "");
+    int written = snprintf(buf, len,
+        "{"
+        "\"StationID\":\"%s\","
+        "\"d_dUPT\":\"%s\","          // moved up
+        "\"MAC\":\"%s\","
+        "\"IP\":\"%s\","
+        "\"location\":\"\","
+        "\"d_dUPS\":%lu,"
+        "\"d_dNM\":\"%s\","
+        "\"d_dDGT\":\"DTF\""
+        "}",
+        mqttId,
+        uptime,
+        mac, ip,
+        uptime_sec,
+        mqttId
+    );
 
-  int64_t uptime_sec = esp_timer_get_time() / 1000000LL;
-  json.addInt("d_dUPS", static_cast<uint64_t>(uptime_sec));
-  json.addString("d_dUPT", ED_SYS::ESP_std::Runtime::uptime());
-
-  // Optional: dNM and dDGT (can be base or moved to provider)
-  json.addString("d_dNM", ED_SYS::ESP_std::Device::mqttName());
-  json.addString("d_dDGT", "DTF");
-
-  // --- Invoke registered field providers (e.g., heap, WiFi) ---
-  for (uint8_t i = 0; i < s_json_provider_count; ++i) {
-    if (s_json_providers[i]) {
-      s_json_providers[i](json);
+    if (written < 0 || written >= (int)len) {
+        ESP_LOGW(TAG, "build_ping_json truncated");
     }
-  }
-
-  json.endObject();
-
-  strncpy(buf, json.toString(), len - 1);
-  buf[len - 1] = '\0';
 }
 
 void MQTTdispatcher::T_info_timer_callback(TimerHandle_t /*handle*/) {
@@ -605,44 +666,42 @@ void MQTTdispatcher::publishInfo() {
     xSemaphoreTake(mutex, portMAX_DELAY);
     esp_mqtt_client_handle_t cl = s_clHandle;
     xSemaphoreGive(mutex);
-     if (!cl) return;
+    if (!cl) return;
 
+    static char topic_info[64];
+    static bool built = false;
+    if (!built) {
+        snprintf(topic_info, sizeof topic_info, "info/connection/%s", s_mqtt_id);
+        built = true;
+    }
 
-  static char topic_info[64];
-  static bool built = false;
-  if (!built) {
-    snprintf(topic_info, sizeof topic_info, "info/connection/%s", s_mqtt_id);
-    built = true;
-  }
+    static char buf[1024];
+    build_ping_json(buf, sizeof buf);
 
-  static char buf[512];
-  build_ping_json(buf, sizeof buf);
+    // Use MqttClient wrapper to get client‑id property automatically
+    bool ok = s_mqtt->publish(topic_info, buf, 0, true);   // QoS0, retain
 
-  int rc = esp_mqtt_client_publish(cl, topic_info, buf, strlen(buf),
-                                     ED_MQTT::MqttClient::MqttQoS::QOS0, true);
-
-  if (rc < 0)
-    ESP_LOGE(TAG, "publishInfo failed");
-  else
-    ESP_LOGI(TAG, "publishInfo ok msg_id=%d", rc);
+    if (!ok)
+        ESP_LOGE(TAG, "publishInfo failed");
+    else
+        ESP_LOGI(TAG, "publishInfo ok");
 }
 
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
   strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
-
   s_config = config;
 
-  s_info_timer = xTimerCreate("info_loop", pdMS_TO_TICKS(3000), pdTRUE, nullptr,
-                              T_info_timer_callback);
-  /*
-if (!s_info_timer) {
-ESP_LOGE(TAG, "xTimerCreate failed");
-return ESP_FAIL;
-}
+  // ── 10-second timer (default) ─────────────────────────────────
+  s_info_timer = xTimerCreate("info_loop", pdMS_TO_TICKS(10000), pdTRUE,
+                              nullptr, T_info_timer_callback);
+  if (!s_info_timer) {
+    ESP_LOGE(TAG, "xTimerCreate failed");
+    return ESP_FAIL;
+  }
 
-xTaskCreate(info_publisher_task, "info_pub", 4096, nullptr, 5,
-&s_info_task_handle);
-*/
+  xTaskCreate(info_publisher_task, "info_pub", 8192, nullptr, 5,
+              &s_info_task_handle);
+
   ESP_LOGI(TAG, "initialized, waiting for IP before starting MQTT");
   return ESP_OK;
 }
@@ -652,7 +711,12 @@ esp_err_t MQTTdispatcher::run() {
   ESP_LOGI(TAG, "run() — MQTT will start once IP is ready");
   return ESP_OK;
 }
+
 void MQTTdispatcher::on_ip_ready() {
+   // Cache IP for later use in info publisher
+    strncpy(s_cached_ip, ED_SYS::ESP_std::Device::curIP(), sizeof(s_cached_ip) - 1);
+    s_cached_ip[sizeof(s_cached_ip) - 1] = '\0';
+
   ESP_LOGI(TAG, "IP ready — creating MQTT client");
   s_mqtt = ED_MQTT::MqttClient::create(s_config);
   if (!s_mqtt) {
@@ -661,7 +725,6 @@ void MQTTdispatcher::on_ip_ready() {
   }
   s_clHandle = s_mqtt->getHandle();
 
-  // Delay long enough for connection to complete (3 seconds)
   ESP_LOGI(TAG, "Waiting 3 seconds for MQTT connection...");
   vTaskDelay(pdMS_TO_TICKS(3000));
 
@@ -671,8 +734,9 @@ void MQTTdispatcher::on_ip_ready() {
   s_mqtt->registerConnectedCallback(on_mqtt_connected);
   s_mqtt->registerDataCallback(on_mqtt_data);
 
-//   if (s_info_timer)
-//     xTimerStart(s_info_timer, 0);
+  // ── Start the periodic timer ─────────────────────────────────
+  if (s_info_timer)
+    xTimerStart(s_info_timer, 0);
 }
 
 void MQTTdispatcher::registerJsonFieldProvider(JsonFieldProvider provider) {
