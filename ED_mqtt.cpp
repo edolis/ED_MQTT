@@ -23,6 +23,7 @@ static const char *TAG = "ED_MQTT";
 static StaticSemaphore_t s_mqtt_mutex_buffer;
 static SemaphoreHandle_t s_mqtt_mutex = nullptr;
 
+
 static SemaphoreHandle_t get_mqtt_mutex() {
   if (s_mqtt_mutex == nullptr) {
     s_mqtt_mutex = xSemaphoreCreateMutexStatic(&s_mqtt_mutex_buffer);
@@ -36,6 +37,7 @@ TimerHandle_t MqttClient::mqtt_reconnect_timer = nullptr;
 TimerHandle_t MqttClient::s_health_timer = nullptr;
 uint8_t MqttClient::s_publish_fail_count = 0;
 MqttClient::ReconnectCallback MqttClient::s_reconnect_callback = nullptr;
+char MqttClient::statusTopicBuf[64] = {};
 
 #ifdef CONFIG_MQTT_PROTOCOL_5
 mqtt5_user_property_handle_t MqttClient::s_publish_property = nullptr;
@@ -135,21 +137,21 @@ static const char *resolve_uri_with_fallback(const char *uri_in) {
 
 // ── Default configuration ──────────────────────────────────────────────
 void MqttClient::setDefaultConfig() {
-  static char topicBuf[64], msgBuf[64];
-  snprintf(topicBuf, sizeof topicBuf, "devices/connection/%s", ED_SYS::ESP_std::Device::mqttName());
-  snprintf(msgBuf, sizeof msgBuf, "%s disconnected unexpectedly.", ED_SYS::ESP_std::Device::mqttName());
-  mqttConfig = {};
-  mqttConfig.broker.address.uri = "mqtts://192.168.1.220:8883";
+  static char  msgBuf[64];
+   snprintf(statusTopicBuf, sizeof statusTopicBuf, "devices/%s/status", ED_SYS::ESP_std::Device::mqttName());
+snprintf(msgBuf, sizeof msgBuf, "offline");  mqttConfig = {};
+  mqttConfig.broker.address.uri = "mqtts://raspi00:8883";
   mqttConfig.broker.verification.use_global_ca_store = false;
   mqttConfig.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
   mqttConfig.credentials.username = ED_MQTT_USERNAME;
   mqttConfig.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
   mqttConfig.credentials.authentication.password = ED_MQTT_PASSWORD;
-  mqttConfig.session.last_will.topic = topicBuf;
+  mqttConfig.session.last_will.topic = statusTopicBuf;
   mqttConfig.session.last_will.msg = msgBuf;
   mqttConfig.session.last_will.qos = MqttQoS::QOS1;
   mqttConfig.session.last_will.retain = true;
   mqttConfig.session.protocol_ver = MQTT_PROTOCOL_V_5;
+
 }
 
 // ── Reconnect timer callback ──────────────────────────────────────────
@@ -176,6 +178,10 @@ MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
 
   if (config) mqttConfig = *config;
   else setDefaultConfig();
+
+  // ✅ Ensure statusTopicBuf is always set (depends on device name, not on config)
+  snprintf(statusTopicBuf, sizeof(statusTopicBuf), "devices/%s/status",
+           ED_SYS::ESP_std::Device::mqttName());
 
   _instance = new MqttClient();
   if (!_instance) {
@@ -318,6 +324,38 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
   switch (event_id) {
   case MQTT_EVENT_CONNECTED: {
     ESP_LOGI(TAG, "Connected");
+    char jsonBuf[1024];
+    snprintf(jsonBuf, sizeof(jsonBuf),
+        "{"
+        "\"device\":\"%s\","
+        "\"project\":\"%s\","
+        "\"version\":\"%s\","
+        "\"tag\":\"%s\","
+        "\"major\":%d,"
+        "\"minor\":%d,"
+        "\"patch\":%d,"
+        "\"build\":%d,"
+        "\"hash_short\":\"%s\","
+        "\"hash_full\":\"%s\","
+        "\"build_id\":\"%s\","
+        "\"dirty\":%s"
+        "}",
+        ED_SYS::ESP_std::Device::mqttName(),          // device ID
+        ED_SYS::ESP_std::Firmware::prjName(),
+        ED_SYS::ESP_std::Firmware::version(),         // full version string
+        ED_SYS::ESP_std::Firmware::tag(),
+        ED_SYS::ESP_std::Firmware::majorVersion(),
+        ED_SYS::ESP_std::Firmware::minorVersion(),
+        ED_SYS::ESP_std::Firmware::patchVersion(),
+        ED_SYS::ESP_std::Firmware::buildNumber(),
+        ED_SYS::ESP_std::Firmware::shortHash(),
+        ED_SYS::ESP_std::Firmware::fullHash(),
+        ED_SYS::ESP_std::Firmware::buildId(),
+        ED_SYS::ESP_std::Firmware::isDirty() ? "true" : "false"
+    );
+
+    // Publish the JSON status (replaces "online")
+    esp_mqtt_client_publish(client, statusTopicBuf, jsonBuf, 0, 1, 1);
     esp_mqtt_client_subscribe(client, "devices/connection", 0);
     int sub_id = esp_mqtt_client_subscribe(client, "cmd", 0);
     ESP_LOGI(TAG, "Subscribe to cmd returned msg_id=%d", sub_id);

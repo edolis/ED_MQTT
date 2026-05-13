@@ -92,6 +92,7 @@ protected:
 private:
   // --- Internal static members ---
   static MqttClient *_instance;
+  static char statusTopicBuf[64];
 
   // Callback tables
   static MqttConnectedCallback connected_callbacks[MAX_CONNECTED_CALLBACKS];
