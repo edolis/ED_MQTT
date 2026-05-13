@@ -373,8 +373,8 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
   static bool built = false;
 
   if (!built) {
-    snprintf(topic_conn, sizeof topic_conn, "devices/connection/%s", s_mqtt_id);
-    snprintf(topic_info, sizeof topic_info, "info/connection/%s", s_mqtt_id);
+    snprintf(topic_conn, sizeof topic_conn, "devices/connections/%s", s_mqtt_id);
+    snprintf(topic_info, sizeof topic_info, "devices/%s/diag", s_mqtt_id);
     built = true;
   }
 
@@ -393,7 +393,7 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
   int sub_msg_id = esp_mqtt_client_subscribe(client, "cmd", 0);
   ESP_LOGI(TAG, "Subscribed to 'cmd', msg_id=%d", sub_msg_id);
 
-  static char info_buf[512];
+  static char info_buf[JSON_BUFFER_SIZE];
   build_ping_json(info_buf, sizeof info_buf);
   esp_mqtt_client_publish(client, topic_info, info_buf, strlen(info_buf),
                           ED_MQTT::MqttClient::MqttQoS::QOS1, true);
@@ -620,32 +620,45 @@ void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
 }
 
 void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
-    const char *mqttId   = ED_SYS::ESP_std::Device::mqttName();
-    const char *mac      = ED_SYS::ESP_std::Device::stdMAC();
-    const char *ip       = s_cached_ip[0] ? s_cached_ip : "0.0.0.0";
-    const char *uptime   = ED_SYS::ESP_std::Runtime::uptime();
-    unsigned long uptime_sec = (unsigned long)(esp_timer_get_time() / 1000000LL);
+    ED_S_JSON::StaticJson doc;
 
-    int written = snprintf(buf, len,
-        "{"
-        "\"StationID\":\"%s\","
-        "\"d_dUPT\":\"%s\","          // moved up
-        "\"MAC\":\"%s\","
-        "\"IP\":\"%s\","
-        "\"location\":\"\","
-        "\"d_dUPS\":%lu,"
-        "\"d_dNM\":\"%s\","
-        "\"d_dDGT\":\"DTF\""
-        "}",
-        mqttId,
-        uptime,
-        mac, ip,
-        uptime_sec,
-        mqttId
-    );
+    // Root object
+    doc.beginObject();
 
-    if (written < 0 || written >= (int)len) {
-        ESP_LOGW(TAG, "build_ping_json truncated");
+    // Core fields
+    doc.addString("dDGT", "DTF");
+    doc.addString("dS", "N");
+    doc.addString("d_UPT", ED_SYS::ESP_std::Runtime::uptime());
+
+    // Diagnostics array
+    doc.beginArray("diagnostics");
+
+    // Call each registered provider – each adds one object to the array
+    for (uint8_t i = 0; i < s_json_provider_count; ++i) {
+        if (s_json_providers[i]) {
+            // Start an anonymous object inside the array
+            doc.beginObject();
+            // Provider adds its fields to this object
+            s_json_providers[i](doc);
+            // Close the object
+            doc.endObject();
+        }
+    }
+
+    doc.endArray();   // end diagnostics array
+    doc.endObject();  // end root object
+
+    // Copy the generated JSON to the output buffer
+    const char* json_str = doc.toString();
+    size_t needed = strlen(json_str) + 1;
+
+    if (needed <= len) {
+        memcpy(buf, json_str, needed);
+    } else {
+        // Truncate safely if output buffer is too small (should not happen)
+        strncpy(buf, json_str, len - 1);
+        buf[len - 1] = '\0';
+        ESP_LOGW(TAG, "build_ping_json truncated (%zu > %zu)", needed - 1, len - 1);
     }
 }
 
@@ -671,11 +684,11 @@ void MQTTdispatcher::publishInfo() {
     static char topic_info[64];
     static bool built = false;
     if (!built) {
-        snprintf(topic_info, sizeof topic_info, "info/connection/%s", s_mqtt_id);
+        snprintf(topic_info, sizeof topic_info, "devices/%s/diag", s_mqtt_id);
         built = true;
     }
 
-    static char buf[1024];
+    static char buf[JSON_BUFFER_SIZE];
     build_ping_json(buf, sizeof buf);
 
     // Use MqttClient wrapper to get client‑id property automatically
@@ -683,8 +696,8 @@ void MQTTdispatcher::publishInfo() {
 
     if (!ok)
         ESP_LOGE(TAG, "publishInfo failed");
-    else
-        ESP_LOGI(TAG, "publishInfo ok");
+    // else
+    //     ESP_LOGI(TAG, "publishInfo ok");
 }
 
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {

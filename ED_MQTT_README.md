@@ -1,4 +1,3 @@
-```markdown
 # ED_MQTT Library Documentation
 
 ## Overview
