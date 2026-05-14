@@ -38,7 +38,7 @@ using MqttConnectedCallback = void (*)(esp_mqtt_client_handle_t client);
 using MqttDataCallback = void (*)(esp_mqtt_client_handle_t client,
                                   const char *topic, int topicLen,
                                   const char *data, size_t dataLen,
-                                  int64_t msgID);
+                                  uint32_t msgID);
 
 // ── Compile-time limits ──────────────────────────────────────────────────────
 static constexpr uint8_t MAX_CONNECTED_CALLBACKS = 4;
@@ -134,7 +134,7 @@ private:
 #endif
 
   // Internal helpers
-  static int64_t mqtt5_get_epoch_property(const esp_mqtt_event_t *event);
+  static uint32_t mqtt5_get_epoch_property(const esp_mqtt_event_t *event);
   static void setDefaultConfig();
   void destroyClient();
   bool isShortOutage();

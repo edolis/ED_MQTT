@@ -64,19 +64,22 @@ public:
     virtual void grabCommand(const char* commandID,
                              const char* commandData,
                              size_t      dataLen,
-                             int64_t     msgID) = 0;
+                             uint32_t     msgID) = 0;
     virtual ~iCommandRunner() = default;
 };
 
 // ── CommandWithRegistry ──────────────────────────────────────────────
 class CommandWithRegistry : public iCommandRunner {
 public:
+    // Constructor that automatically registers this registry with GlobalCommandRegistry
+    CommandWithRegistry(const char* regID, const char* briefDesc = nullptr);
+
     CommandRegistry registry;
 
     void grabCommand(const char* commandID,
                      const char* commandData,
                      size_t      dataLen,
-                     int64_t     msgID) override;
+                     uint32_t     msgID) override;
 
     void registerCommand(const ctrlCommand& cmd) { registry.registerCommand(cmd); }
     bool dispatchCommand(const char* cmdID)     { return registry.dispatch(cmdID); }
@@ -93,6 +96,10 @@ struct RegistryInfo {
 class GlobalCommandRegistry {
 public:
     static GlobalCommandRegistry& instance();
+     uint8_t getRegistryCount() const { return m_count; }
+    const char* getFirstRegistryID() const {
+        return (m_count > 0) ? m_registries[0].regID : nullptr;
+    }
 
     void setBaseUrl(const char* url);
     bool registerRegistry(const char* regID, CommandRegistry* reg, const char* briefDesc = nullptr);
@@ -136,7 +143,7 @@ static char s_cached_ip[16];   // enough for IPv4
     static void on_mqtt_data(esp_mqtt_client_handle_t client,
                              const char* topic, int topicLen,
                              const char* data, size_t dataLen,
-                             int64_t msgID);
+                             uint32_t msgID);
     static void on_ip_ready();
 
     static bool parseCommand(const char* input, size_t inputLen,
@@ -147,7 +154,7 @@ static char s_cached_ip[16];   // enough for IPv4
     static void T_info_timer_callback(TimerHandle_t handle);
     static void info_publisher_task(void* arg);
     static void publishInfo();
-    static void handleCommandObject(const char* json, size_t jsonLen, int64_t cmdID);
+    static void handleCommandObject(const char* json, size_t jsonLen, uint32_t cmdID);
 
     // --- Static members ---
     static iCommandRunner* s_subscribers[MAX_CMD_SUBSCRIBERS];

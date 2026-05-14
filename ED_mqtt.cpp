@@ -403,8 +403,16 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                         ? (s_payload_len >= s_payload_expected)
                         : (event->current_data_offset + incoming >= (size_t)event->total_data_len);
     if (complete) {
-      int64_t msgID = mqtt5_get_epoch_property(event);
-      for (uint8_t i = 0; i < data_callback_count; ++i)
+uint32_t msgID = mqtt5_get_epoch_property(event);
+if (msgID == 0) {
+    // Fallback to packet ID if epoch missing or zero (zero is unlikely for real epoch)
+    msgID = event->msg_id;
+    ESP_LOGI(TAG, "Epoch not available, using packet ID: %u", msgID);
+} else {
+    ESP_LOGI(TAG, "Using epoch: %u", msgID);
+}
+
+for (uint8_t i = 0; i < data_callback_count; ++i)
         if (data_callbacks[i])
           data_callbacks[i](event->client, event->topic, event->topic_len,
                             s_payload_buf, s_payload_len, msgID);
@@ -422,38 +430,80 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
 }
 
 // ── MQTT5 epoch property ──────────────────────────────────────────────
-int64_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
+uint32_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
 #ifdef CONFIG_MQTT_PROTOCOL_5
-  if (!event || !event->property || !event->property->user_property) return -1;
-  mqtt5_user_property_handle_t handle = event->property->user_property;
-  uint8_t count = esp_mqtt5_client_get_user_property_count(handle);
-  if (count == 0) return -1;
-  constexpr uint8_t STACK_THRESHOLD = 4;
-  if (count <= STACK_THRESHOLD) {
-    esp_mqtt5_user_property_item_t items[STACK_THRESHOLD];
-    uint8_t actual = count;
-    if (esp_mqtt5_client_get_user_property(handle, items, &actual) == ESP_OK) {
-      for (uint8_t i = 0; i < actual; ++i)
-        if (items[i].key && strcmp(items[i].key, "epoch") == 0)
-          return atoll(items[i].value);
+    if (!event) {
+        ESP_LOGI(TAG, "epoch: event is NULL");
+        return 0;
     }
-    return -1;
-  }
-  auto *items = (esp_mqtt5_user_property_item_t *)malloc(sizeof(esp_mqtt5_user_property_item_t) * count);
-  if (!items) return -1;
-  int64_t result = -1;
-  uint8_t actual = count;
-  if (esp_mqtt5_client_get_user_property(handle, items, &actual) == ESP_OK) {
-    for (uint8_t i = 0; i < actual; ++i)
-      if (items[i].key && strcmp(items[i].key, "epoch") == 0) {
-        result = atoll(items[i].value);
-        break;
-      }
-  }
-  free(items);
-  return result;
+    if (!event->property || !event->property->user_property) {
+        ESP_LOGI(TAG, "epoch: property or user_property is NULL");
+        return 0;
+    }
+
+    mqtt5_user_property_handle_t handle = event->property->user_property;
+    uint8_t count = esp_mqtt5_client_get_user_property_count(handle);
+    ESP_LOGI(TAG, "epoch: property count = %u", count);
+    if (count == 0) return 0;
+
+    // Allocate on heap to avoid stack overflow (count is small)
+    esp_mqtt5_user_property_item_t *items = (esp_mqtt5_user_property_item_t*)malloc(
+        sizeof(esp_mqtt5_user_property_item_t) * count);
+    if (!items) {
+        ESP_LOGE(TAG, "epoch: malloc failed");
+        return 0;
+    }
+
+    uint8_t actual = count;
+    esp_err_t err = esp_mqtt5_client_get_user_property(handle, items, &actual);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "epoch: get_user_property failed: %s", esp_err_to_name(err));
+        free(items);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "epoch: actual properties = %u", actual);
+    uint32_t result = 0;
+    for (uint8_t i = 0; i < actual; i++) {
+        ESP_LOGD(TAG, "epoch: property[%u] key='%s', value='%s'",
+                 i, items[i].key ? items[i].key : "(null)",
+                 items[i].value ? items[i].value : "(null)");
+        if (items[i].key && strcmp(items[i].key, "epoch") == 0 && items[i].value) {
+            // Copy the value to a local buffer
+            char epoch_str[32];
+            size_t len = strlen(items[i].value);
+            if (len >= sizeof(epoch_str)) len = sizeof(epoch_str)-1;
+            memcpy(epoch_str, items[i].value, len);
+            epoch_str[len] = '\0';
+            ESP_LOGI(TAG, "epoch: raw value = '%s' (len=%zu)", epoch_str, len);
+
+            // Manual digit‑by‑digit conversion (no strtoll, avoids %lld)
+            uint32_t val = 0;
+            const char *p = epoch_str;
+            while (*p >= '0' && *p <= '9') {
+                // Check for overflow (2^32-1 is 4294967295, max 10 digits)
+                if (val > 429496729) {   // 429496729 = 2^32/10 - 1, prevents overflow
+                    ESP_LOGW(TAG, "epoch: value > 2^32-1, truncating to 32-bit");
+                }
+                val = val * 10 + (*p - '0');
+                p++;
+            }
+            if (*p == '\0') {
+                result = val;
+                ESP_LOGI(TAG, "epoch: successfully parsed epoch = %u", result);
+            } else {
+                ESP_LOGW(TAG, "epoch: invalid characters after digits: '%s'", p);
+                result = 0;
+            }
+            break;
+        }
+    }
+    free(items);
+    ESP_LOGI(TAG, "epoch: returning %u", result);
+    return result;
 #else
-  return -1;
+    ESP_LOGW(TAG, "MQTT5 not enabled, returning 0");
+    return 0;
 #endif
 }
 

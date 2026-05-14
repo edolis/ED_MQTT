@@ -76,7 +76,6 @@ void ctrlCommand::appendHelp(char *buf, size_t len) const {
 // ── CommandRegistry ──────────────────────────────────────────────────
 void CommandRegistry::registerCommand(const ctrlCommand &cmd) {
   if (count >= MAX_COMMANDS) {
-    ESP_LOGE("CmdReg", "Command table full (max %d)", MAX_COMMANDS);
     return;
   }
   for (uint8_t i = 0; i < count; ++i)
@@ -140,87 +139,107 @@ void CommandRegistry::getHelpDetail(const char *cmdID, char *buf,
   }
 }
 
+CommandWithRegistry::CommandWithRegistry(const char* regID, const char* briefDesc) {
+    GlobalCommandRegistry::instance().registerRegistry(regID, &registry, briefDesc);
+}
+
 // ── CommandWithRegistry::grabCommand (injects _msgID and _original) ──
 void CommandWithRegistry::grabCommand(const char *commandID,
                                       const char *commandData,
-                                      size_t /*dataLen*/, int64_t msgID) {
-  ctrlCommand *cmd = registry.getCommand(commandID);
-  if (!cmd)
-    return;
+                                      size_t /*dataLen*/,
+                                      uint32_t msgID) {
 
-  // Inject _msgID
-  char msgIDstr[24];
-  snprintf(msgIDstr, sizeof(msgIDstr), "%lld", (long long)msgID);
-  if (!cmd->setParam("_msgID", msgIDstr))
-    cmd->addParam("_msgID", msgIDstr);
-
-  // Inject the original full command (commandID + commandData)
-  char originalBuf[PARAM_VAL_LEN];
-  snprintf(originalBuf, sizeof(originalBuf), "%s %s", commandID,
-           commandData ? commandData : "");
-  if (!cmd->setParam("_original", originalBuf))
-    cmd->addParam("_original", originalBuf);
-
-  // Parse colon‑format flags: -key value
-  const char *p = commandData;
-  if (!p)
-    p = "";
-
-  while (*p && isspace((unsigned char)*p))
-    ++p;
-
-  // First token = default value (if not a flag)
-  if (*p && *p != '-') {
-    const char *d0 = p;
-    while (*p && !isspace((unsigned char)*p))
-      ++p;
-    char tmp[PARAM_VAL_LEN];
-    size_t n = (size_t)(p - d0);
-    if (n >= sizeof tmp)
-      n = sizeof tmp - 1;
-    memcpy(tmp, d0, n);
-    tmp[n] = '\0';
-    if (!cmd->setParam("_default", tmp))
-      cmd->addParam("_default", tmp);
-  }
-
-  // Remaining tokens: -key [value]
-  while (*p) {
-    while (*p && isspace((unsigned char)*p))
-      ++p;
-    if (*p != '-')
-      break;
-    ++p;
-
-    const char *f0 = p;
-    while (*p && isalnum((unsigned char)*p))
-      ++p;
-    char flagbuf[PARAM_KEY_LEN];
-    size_t flen = (size_t)(p - f0);
-    if (flen >= sizeof flagbuf)
-      flen = sizeof flagbuf - 1;
-    memcpy(flagbuf, f0, flen);
-    flagbuf[flen] = '\0';
-
-    while (*p && isspace((unsigned char)*p))
-      ++p;
-    char valbuf[PARAM_VAL_LEN] = {};
-    if (*p && *p != '-') {
-      const char *v0 = p;
-      while (*p && !isspace((unsigned char)*p))
-        ++p;
-      size_t vlen = (size_t)(p - v0);
-      if (vlen >= sizeof valbuf)
-        vlen = sizeof valbuf - 1;
-      memcpy(valbuf, v0, vlen);
+    ctrlCommand *cmd = registry.getCommand(commandID);
+    if (!cmd) {
+        ESP_LOGW("CmdReg", "Command '%s' not found", commandID);
+        return;
     }
 
-    if (!cmd->setParam(flagbuf, valbuf))
-      cmd->addParam(flagbuf, valbuf);
-  }
+    // Convert msgID to string safely
+    char msgIDstr[24];
+    int len = snprintf(msgIDstr, sizeof(msgIDstr), "%lu", (uint32_t)msgID);
+    if (len <= 0 || len >= (int)sizeof(msgIDstr)) {
+        ESP_LOGE("CmdReg", "Failed to convert msgID to string, using fallback '0'");
+        strcpy(msgIDstr, "0");
+    }
 
-  if (cmd->funcPointer)
-    cmd->funcPointer(cmd);
+    // Inject _msgID (use a dedicated key that won't be overwritten by flag parsing)
+    // First try to setParam, if fails then addParam
+    if (!cmd->setParam("_msgID", msgIDstr)) {
+        ESP_LOGI("CmdReg", "Adding _msgID param (setParam failed)");
+        cmd->addParam("_msgID", msgIDstr);
+    }
+
+    // Also store a second copy under a different key as a backup
+    if (!cmd->setParam("_msgID_raw", msgIDstr)) {
+        cmd->addParam("_msgID_raw", msgIDstr);
+    }
+
+    // Verify that the parameter was stored correctly
+    const char *check = cmd->getParam("_msgID");
+
+    // Inject the original full command string
+    char originalBuf[PARAM_VAL_LEN];
+    snprintf(originalBuf, sizeof(originalBuf), "%s %s", commandID, commandData ? commandData : "");
+    if (!cmd->setParam("_original", originalBuf))
+        cmd->addParam("_original", originalBuf);
+
+    // Parse colon‑format flags: -key value
+    const char *p = commandData;
+    if (!p) p = "";
+
+    // Skip leading whitespace
+    while (*p && isspace((unsigned char)*p)) ++p;
+
+    // First token = default value (if not a flag)
+    if (*p && *p != '-') {
+        const char *d0 = p;
+        while (*p && !isspace((unsigned char)*p)) ++p;
+        char tmp[PARAM_VAL_LEN];
+        size_t n = (size_t)(p - d0);
+        if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+        memcpy(tmp, d0, n);
+        tmp[n] = '\0';
+        if (!cmd->setParam("_default", tmp))
+            cmd->addParam("_default", tmp);
+    }
+
+    // Remaining tokens: -key [value]
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) ++p;
+        if (*p != '-') break;
+        ++p; // skip '-'
+
+        const char *f0 = p;
+        while (*p && isalnum((unsigned char)*p)) ++p;
+        char flagbuf[PARAM_KEY_LEN];
+        size_t flen = (size_t)(p - f0);
+        if (flen >= sizeof(flagbuf)) flen = sizeof(flagbuf) - 1;
+        memcpy(flagbuf, f0, flen);
+        flagbuf[flen] = '\0';
+
+        while (*p && isspace((unsigned char)*p)) ++p;
+        char valbuf[PARAM_VAL_LEN] = {};
+        if (*p && *p != '-') {
+            const char *v0 = p;
+            while (*p && !isspace((unsigned char)*p)) ++p;
+            size_t vlen = (size_t)(p - v0);
+            if (vlen >= sizeof(valbuf)) vlen = sizeof(valbuf) - 1;
+            memcpy(valbuf, v0, vlen);
+        }
+
+        // Use addParam because the flag may not exist yet; we don't want to overwrite existing values.
+        // But setParam first to avoid duplicate if it already exists.
+        if (!cmd->setParam(flagbuf, valbuf))
+            cmd->addParam(flagbuf, valbuf);
+    }
+
+    // Final sanity check for _msgID
+    const char *finalMsgID = cmd->getParam("_msgID");
+
+    // Execute the command
+    if (cmd->funcPointer)
+        cmd->funcPointer(cmd);
 }
 
 // ── GlobalCommandRegistry (singleton) ───────────────────────────────
@@ -248,59 +267,62 @@ RegistryInfo *GlobalCommandRegistry::findRegistry(const char *regID) const {
 }
 
 void GlobalCommandRegistry::getHelpOverview(char *buf, size_t len) const {
-  if (!m_baseUrl) {
-    snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
-    return;
-  }
   if (m_count == 0) {
     snprintf(buf, len, "No registries available.");
     return;
   }
-  size_t used = snprintf(
-      buf, len, "Documentation: %s#cmd_index\n\nRegistries:\n", m_baseUrl);
+
+  size_t used = 0;
+  if (m_baseUrl) {
+    used = snprintf(buf, len, "Documentation: %s#cmd_index\n\nRegistries:\n", m_baseUrl);
+  } else {
+    used = snprintf(buf, len, "Documentation URL not set.\n\nRegistries:\n");
+  }
+
   for (uint8_t i = 0; i < m_count && used < len; ++i) {
-    used +=
-        snprintf(buf + used, len - used, "  %s - %s\n", m_registries[i].regID,
-                 m_registries[i].briefDesc ? m_registries[i].briefDesc : "");
+    used += snprintf(buf + used, len - used, "  %s - %s\n", m_registries[i].regID,
+                     m_registries[i].briefDesc ? m_registries[i].briefDesc : "");
   }
 }
 
 void GlobalCommandRegistry::getRegistryHelp(const char *regID, char *buf,
                                             size_t len) const {
-  if (!m_baseUrl) {
-    snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
-    return;
-  }
   RegistryInfo *info = findRegistry(regID);
   if (!info) {
     snprintf(buf, len, "Registry '%s' not found.", regID);
     return;
   }
-  size_t used =
-      snprintf(buf, len, "Registry %s: %s\nDocumentation: %s#%s\n\nCommands:\n",
-               info->regID, info->briefDesc ? info->briefDesc : "", m_baseUrl,
-               info->regID);
+
+  size_t used = 0;
+  if (m_baseUrl) {
+    used = snprintf(buf, len, "Registry %s: %s\nDocumentation: %s#%s\n\nCommands:\n",
+                    info->regID, info->briefDesc ? info->briefDesc : "", m_baseUrl,
+                    info->regID);
+  } else {
+    used = snprintf(buf, len, "Registry %s: %s\nDocumentation URL not set.\n\nCommands:\n",
+                    info->regID, info->briefDesc ? info->briefDesc : "");
+  }
+
   info->registry->getHelpBrief(buf + used, len - used);
 }
 
 void GlobalCommandRegistry::getCommandHelp(const char *regID, const char *cmdID,
                                            char *buf, size_t len) const {
-  if (!m_baseUrl) {
-    snprintf(buf, len, "Base URL not set. Call setBaseUrl() first.");
-    return;
-  }
   RegistryInfo *info = findRegistry(regID);
   if (!info) {
     snprintf(buf, len, "Registry '%s' not found.", regID);
     return;
   }
+
   const ctrlCommand *cmd = info->registry->getCommand(cmdID);
   if (!cmd) {
     snprintf(buf, len, "Command '%s' not found in registry %s.", cmdID, regID);
     return;
   }
+
   size_t used = snprintf(buf, len, "%s: %s\n", cmd->cmdID,
                          cmd->cmdDex ? cmd->cmdDex : "");
+
   if (cmd->paramCount > 0) {
     used += snprintf(buf + used, len - used, "Parameters:\n");
     for (uint8_t i = 0; i < cmd->paramCount && used < len; ++i) {
@@ -310,8 +332,12 @@ void GlobalCommandRegistry::getCommandHelp(const char *regID, const char *cmdID,
   } else {
     used += snprintf(buf + used, len - used, "No parameters.\n");
   }
-  snprintf(buf + used, len - used, "Full details: %s#%s", m_baseUrl,
-           info->regID);
+
+  if (m_baseUrl) {
+    snprintf(buf + used, len - used, "Full details: %s#%s", m_baseUrl, info->regID);
+  } else {
+    snprintf(buf + used, len - used, "Full details: URL not configured.");
+  }
 }
 
 // ── MQTTdispatcher implementation ────────────────────────────────────
@@ -402,7 +428,7 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
 void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
                                   const char *topic, int topicLen,
                                   const char *data, size_t dataLen,
-                                  int64_t msgID) {
+                                  uint32_t msgID) {
     ESP_LOGD(TAG, "MQTT data received: topic=%.*s, data=%.*s", topicLen, topic,
              (int)dataLen, data);
 
@@ -414,26 +440,40 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
         ESP_LOGD(TAG, "✅ Parsed colon command: '%s', payload='%s'", cmdID, payload_buf);
 
         // HELP command handling
-        if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
-            static char helpBuf[1024];
-            char arg1[CMD_ID_LEN] = {0};
-            char arg2[CMD_ID_LEN] = {0};
-            sscanf(payload_buf, "%15s %15s", arg1, arg2);
+if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
+    static char helpBuf[1024];
+    char arg1[CMD_ID_LEN] = {0};
+    char arg2[CMD_ID_LEN] = {0};
+    sscanf(payload_buf, "%15s %15s", arg1, arg2);
 
-            if (arg2[0] != '\0')
-                GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf,
-                                                                 sizeof(helpBuf));
-            else if (arg1[0] != '\0')
-                GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf,
-                                                                  sizeof(helpBuf));
-            else
-                GlobalCommandRegistry::instance().getHelpOverview(helpBuf,
-                                                                  sizeof(helpBuf));
-
-            esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf,
-                                    strlen(helpBuf), 0, 0);
-            return;
+    if (arg2[0] != '\0') {
+        // HELP <registry> <command>
+        GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf, sizeof(helpBuf));
+    }
+    else if (arg1[0] != '\0') {
+        // HELP <registry>
+        GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf, sizeof(helpBuf));
+    }
+    else {
+        // No arguments: decide based on number of registries
+        uint8_t regCount = GlobalCommandRegistry::instance().getRegistryCount();
+        if (regCount == 1) {
+            // Only one registry – show its help directly
+            const char* regID = GlobalCommandRegistry::instance().getFirstRegistryID();
+            if (regID) {
+                GlobalCommandRegistry::instance().getRegistryHelp(regID, helpBuf, sizeof(helpBuf));
+            } else {
+                snprintf(helpBuf, sizeof(helpBuf), "Error: registry ID is null.");
+            }
+        } else {
+            // Multiple registries – show overview
+            GlobalCommandRegistry::instance().getHelpOverview(helpBuf, sizeof(helpBuf));
         }
+    }
+
+    esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf, strlen(helpBuf), 0, 0);
+    return;
+}
 
         // ── PFREQ command: configure periodic ping interval ────────
         if (strcmp(cmdID, "PFREQ") == 0) {
@@ -533,7 +573,7 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
 }
 
 void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
-                                         int64_t cmdID) {
+                                         uint32_t cmdID) {
   // ----- Step 1: try as single object with "cmd" and "data" -----
   ED_S_JSON::StaticJson decoder(json);
   if (decoder.isValid()) {
