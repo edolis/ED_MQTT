@@ -23,7 +23,6 @@ static const char *TAG = "ED_MQTT";
 static StaticSemaphore_t s_mqtt_mutex_buffer;
 static SemaphoreHandle_t s_mqtt_mutex = nullptr;
 
-
 static SemaphoreHandle_t get_mqtt_mutex() {
   if (s_mqtt_mutex == nullptr) {
     s_mqtt_mutex = xSemaphoreCreateMutexStatic(&s_mqtt_mutex_buffer);
@@ -77,6 +76,8 @@ void MqttClient::reconnect_task(void *arg) {
             esp_err_t err = self->start(mqttConfig);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Reconnect start failed: %s", esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "Reconnect succeeded");
             }
         }
     }
@@ -138,8 +139,9 @@ static const char *resolve_uri_with_fallback(const char *uri_in) {
 // ── Default configuration ──────────────────────────────────────────────
 void MqttClient::setDefaultConfig() {
   static char  msgBuf[64];
-   snprintf(statusTopicBuf, sizeof statusTopicBuf, "devices/%s/status", ED_SYS::ESP_std::Device::mqttName());
-snprintf(msgBuf, sizeof msgBuf, "offline");  mqttConfig = {};
+  snprintf(statusTopicBuf, sizeof statusTopicBuf, "devices/%s/status", ED_SYS::ESP_std::Device::mqttName());
+  snprintf(msgBuf, sizeof msgBuf, "offline");
+  mqttConfig = {};
   mqttConfig.broker.address.uri = "mqtts://raspi00:8883";
   mqttConfig.broker.verification.use_global_ca_store = false;
   mqttConfig.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
@@ -151,18 +153,23 @@ snprintf(msgBuf, sizeof msgBuf, "offline");  mqttConfig = {};
   mqttConfig.session.last_will.qos = MqttQoS::QOS1;
   mqttConfig.session.last_will.retain = true;
   mqttConfig.session.protocol_ver = MQTT_PROTOCOL_V_5;
-
 }
 
 // ── Reconnect timer callback ──────────────────────────────────────────
 void MqttClient::mqtt_reconnect_timer_cb(TimerHandle_t xTimer) {
-  if (reconnect_queue) {
+    if (reconnect_queue == nullptr) {
+        reconnect_queue = xQueueCreate(5, sizeof(uint32_t));
+        configASSERT(reconnect_queue);
+    }
+    if (reconnect_task_handle == nullptr) {
+        xTaskCreate(reconnect_task, "mqtt_reconnect", 4096, nullptr,
+                    tskIDLE_PRIORITY + 2, &reconnect_task_handle);
+    }
     uint32_t signal = 1;
     xQueueSend(reconnect_queue, &signal, 0);
-  }
 }
 
-// ── Teardown task (releases mutex before destroying) ──────────────────
+// ── Teardown task ──────────────────────────────────────────────────────
 void MqttClient::teardown_task(void *arg) {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -179,7 +186,6 @@ MqttClient *MqttClient::create(esp_mqtt_client_config_t *config) {
   if (config) mqttConfig = *config;
   else setDefaultConfig();
 
-  // ✅ Ensure statusTopicBuf is always set (depends on device name, not on config)
   snprintf(statusTopicBuf, sizeof(statusTopicBuf), "devices/%s/status",
            ED_SYS::ESP_std::Device::mqttName());
 
@@ -217,7 +223,7 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (client != nullptr) {
         xSemaphoreGive(mutex);
-        return ESP_OK;  // already started
+        return ESP_OK;
     }
 
     const char *uri = resolve_uri_with_fallback(config.broker.address.uri);
@@ -229,7 +235,6 @@ esp_err_t MqttClient::start(esp_mqtt_client_config_t config) {
     }
 
 #ifdef CONFIG_MQTT_PROTOCOL_5
-    // Create a user property handle with one item: "client-id"
     if (s_publish_property == nullptr) {
         esp_mqtt5_user_property_item_t prop_item = {
             .key = "client-id",
@@ -282,10 +287,8 @@ void MqttClient::health_timer_cb(TimerHandle_t xTimer) {
     xSemaphoreTake(mutex, portMAX_DELAY);
     uint8_t fails = s_publish_fail_count;
     if (fails >= MAX_CONSECUTIVE_FAILURES) {
-        // Reset early to avoid double-trigger
         s_publish_fail_count = 0;
         xSemaphoreGive(mutex);
-
         ESP_LOGW(TAG, "%u publish failures, forcing reconnect", fails);
         forceReconnect();
         if (s_reconnect_callback) s_reconnect_callback();
@@ -308,8 +311,14 @@ bool MqttClient::isShortOutage() {
 
 void MqttClient::forceReconnect() {
     ESP_LOGW(TAG, "forceReconnect() called");
-    if (teardown_task_handle) xTaskNotify(teardown_task_handle, 0, eNoAction); // triggers destroyClient via teardown task
-    // Alternative: directly call destroyClient() here if you prefer, but teardown task is already there.
+    if (mqtt_reconnect_timer) {
+        xTimerStop(mqtt_reconnect_timer, 0);
+    }
+    if (teardown_task_handle) {
+        xTaskNotify(teardown_task_handle, 0, eNoAction);
+    } else {
+        ESP_LOGE(TAG, "teardown_task_handle is NULL");
+    }
     scheduleReconnect(1000);
 }
 
@@ -340,9 +349,9 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
         "\"build_id\":\"%s\","
         "\"dirty\":%s"
         "}",
-        ED_SYS::ESP_std::Device::mqttName(),          // device ID
+        ED_SYS::ESP_std::Device::mqttName(),
         ED_SYS::ESP_std::Firmware::prjName(),
-        ED_SYS::ESP_std::Firmware::version(),         // full version string
+        ED_SYS::ESP_std::Firmware::version(),
         ED_SYS::ESP_std::Firmware::tag(),
         ED_SYS::ESP_std::Firmware::majorVersion(),
         ED_SYS::ESP_std::Firmware::minorVersion(),
@@ -354,7 +363,6 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
         ED_SYS::ESP_std::Firmware::isDirty() ? "true" : "false"
     );
 
-    // Publish the JSON status (replaces "online")
     esp_mqtt_client_publish(client, statusTopicBuf, jsonBuf, 0, 1, 1);
     esp_mqtt_client_subscribe(client, "devices/connection", 0);
     int sub_id = esp_mqtt_client_subscribe(client, "cmd", 0);
@@ -365,13 +373,8 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
   }
 
   case MQTT_EVENT_DISCONNECTED:
-    if (isShortOutage()) {
-      ESP_LOGW(TAG, "Transient disconnect, letting MQTT auto‑reconnect");
-    } else {
-      ESP_LOGE(TAG, "Prolonged disconnect, tearing down client");
-      if (teardown_task_handle) xTaskNotify(teardown_task_handle, 0, eNoAction);
-      scheduleReconnect(3000);
-    }
+    ESP_LOGW(TAG, "MQTT disconnected, forcing reconnect");
+    forceReconnect();
     break;
 
   case MQTT_EVENT_ERROR:
@@ -383,7 +386,7 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
     break;
 
   case MQTT_EVENT_DATA: {
-    ESP_LOGI(TAG, "MQTT EVENT DATA received: topic=%.*s, data=%.*s",
+    ESP_LOGD(TAG, "MQTT EVENT DATA received: topic=%.*s, data=%.*s",
              event->topic_len, event->topic,
              event->data_len, event->data);
     if (event->current_data_offset == 0) {
@@ -403,16 +406,14 @@ void MqttClient::handleEvent(esp_event_base_t base, int32_t event_id,
                         ? (s_payload_len >= s_payload_expected)
                         : (event->current_data_offset + incoming >= (size_t)event->total_data_len);
     if (complete) {
-uint32_t msgID = mqtt5_get_epoch_property(event);
-if (msgID == 0) {
-    // Fallback to packet ID if epoch missing or zero (zero is unlikely for real epoch)
-    msgID = event->msg_id;
-    ESP_LOGI(TAG, "Epoch not available, using packet ID: %u", msgID);
-} else {
-    ESP_LOGI(TAG, "Using epoch: %u", msgID);
-}
-
-for (uint8_t i = 0; i < data_callback_count; ++i)
+      uint32_t msgID = mqtt5_get_epoch_property(event);
+      if (msgID == 0) {
+        msgID = event->msg_id;
+        ESP_LOGD(TAG, "Epoch not available, using packet ID: %u", msgID);
+      } else {
+        ESP_LOGD(TAG, "Using epoch: %u", msgID);
+      }
+      for (uint8_t i = 0; i < data_callback_count; ++i)
         if (data_callbacks[i])
           data_callbacks[i](event->client, event->topic, event->topic_len,
                             s_payload_buf, s_payload_len, msgID);
@@ -432,21 +433,13 @@ for (uint8_t i = 0; i < data_callback_count; ++i)
 // ── MQTT5 epoch property ──────────────────────────────────────────────
 uint32_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
 #ifdef CONFIG_MQTT_PROTOCOL_5
-    if (!event) {
-        ESP_LOGI(TAG, "epoch: event is NULL");
+    if (!event || !event->property || !event->property->user_property) {
         return 0;
     }
-    if (!event->property || !event->property->user_property) {
-        ESP_LOGI(TAG, "epoch: property or user_property is NULL");
-        return 0;
-    }
-
     mqtt5_user_property_handle_t handle = event->property->user_property;
     uint8_t count = esp_mqtt5_client_get_user_property_count(handle);
-    ESP_LOGI(TAG, "epoch: property count = %u", count);
     if (count == 0) return 0;
 
-    // Allocate on heap to avoid stack overflow (count is small)
     esp_mqtt5_user_property_item_t *items = (esp_mqtt5_user_property_item_t*)malloc(
         sizeof(esp_mqtt5_user_property_item_t) * count);
     if (!items) {
@@ -457,52 +450,37 @@ uint32_t MqttClient::mqtt5_get_epoch_property(const esp_mqtt_event_t *event) {
     uint8_t actual = count;
     esp_err_t err = esp_mqtt5_client_get_user_property(handle, items, &actual);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "epoch: get_user_property failed: %s", esp_err_to_name(err));
         free(items);
         return 0;
     }
 
-    ESP_LOGI(TAG, "epoch: actual properties = %u", actual);
     uint32_t result = 0;
     for (uint8_t i = 0; i < actual; i++) {
-        ESP_LOGD(TAG, "epoch: property[%u] key='%s', value='%s'",
-                 i, items[i].key ? items[i].key : "(null)",
-                 items[i].value ? items[i].value : "(null)");
         if (items[i].key && strcmp(items[i].key, "epoch") == 0 && items[i].value) {
-            // Copy the value to a local buffer
             char epoch_str[32];
             size_t len = strlen(items[i].value);
             if (len >= sizeof(epoch_str)) len = sizeof(epoch_str)-1;
             memcpy(epoch_str, items[i].value, len);
             epoch_str[len] = '\0';
-            ESP_LOGI(TAG, "epoch: raw value = '%s' (len=%zu)", epoch_str, len);
 
-            // Manual digit‑by‑digit conversion (no strtoll, avoids %lld)
             uint32_t val = 0;
             const char *p = epoch_str;
             while (*p >= '0' && *p <= '9') {
-                // Check for overflow (2^32-1 is 4294967295, max 10 digits)
-                if (val > 429496729) {   // 429496729 = 2^32/10 - 1, prevents overflow
-                    ESP_LOGW(TAG, "epoch: value > 2^32-1, truncating to 32-bit");
+                if (val > 429496729) {
+                    ESP_LOGW(TAG, "epoch: value > 2^32-1, truncating");
                 }
                 val = val * 10 + (*p - '0');
                 p++;
             }
             if (*p == '\0') {
                 result = val;
-                ESP_LOGI(TAG, "epoch: successfully parsed epoch = %u", result);
-            } else {
-                ESP_LOGW(TAG, "epoch: invalid characters after digits: '%s'", p);
-                result = 0;
             }
             break;
         }
     }
     free(items);
-    ESP_LOGI(TAG, "epoch: returning %u", result);
     return result;
 #else
-    ESP_LOGW(TAG, "MQTT5 not enabled, returning 0");
     return 0;
 #endif
 }
@@ -518,7 +496,6 @@ MqttClient::~MqttClient() {
     esp_mqtt_client_destroy(client);
     client = nullptr;
   }
-
 #ifdef CONFIG_MQTT_PROTOCOL_5
   if (s_publish_property) {
     esp_mqtt5_client_delete_user_property(s_publish_property);
