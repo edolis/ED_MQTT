@@ -77,7 +77,7 @@ void MqttClient::reconnect_task(void *arg) {
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "Reconnect start failed: %s", esp_err_to_name(err));
             } else {
-                ESP_LOGI(TAG, "Reconnect succeeded");
+                 ESP_LOGI(TAG, "MQTT client re‑initialised (connection pending)");
             }
         }
     }

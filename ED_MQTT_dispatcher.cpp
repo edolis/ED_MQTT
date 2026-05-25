@@ -43,10 +43,15 @@ uint8_t MQTTdispatcher::s_ping_fail_count = 0;
 
 // MQTT client ready flag
 static bool s_mqtt_ready = false;
+bool MQTTdispatcher::s_reconnect_pending = false;
 
 // Ping callbacks
 MQTTdispatcher::PingSuccessCallback MQTTdispatcher::s_ping_success_cb = nullptr;
 MQTTdispatcher::PingFailureCallback MQTTdispatcher::s_ping_failure_cb = nullptr;
+
+// Multi-level recovery
+uint8_t MQTTdispatcher::s_mqtt_reconnect_attempts = 0;
+int64_t MQTTdispatcher::s_last_wifi_reconnect_time = 0;
 
 //-------------------------------------------------------------
 
@@ -422,6 +427,10 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
     s_ping_fail_count = 0;
     s_last_ping_msg_id = 0;
     s_mqtt_ready = true;
+    s_reconnect_pending = false;
+
+    // Reset multi-level recovery counter on successful connection
+    s_mqtt_reconnect_attempts = 0;
 
     // Register MQTT event handlers (must be done for every new client)
     esp_mqtt_client_register_event(client, MQTT_EVENT_PUBLISHED,
@@ -727,7 +736,31 @@ void MQTTdispatcher::publishInfo() {
             if (s_ping_failure_cb) s_ping_failure_cb();
             s_mqtt_ready = false;
             if (s_info_timer) xTimerStop(s_info_timer, 0);
-            ED_MQTT::MqttClient::forceReconnect();
+
+            // Multi-level recovery
+            if (!s_reconnect_pending) {
+                s_reconnect_pending = true;
+                s_mqtt_reconnect_attempts++;
+                ESP_LOGW(TAG, "MQTT reconnect attempt #%d", s_mqtt_reconnect_attempts);
+
+                if (s_mqtt_reconnect_attempts >= MQTT_RECONNECT_THRESHOLD) {
+                    int64_t now = esp_timer_get_time() / 1000000;
+                    if (now - s_last_wifi_reconnect_time >= WIFI_RECONNECT_COOLDOWN_SEC) {
+                        ESP_LOGW(TAG, "Threshold reached, forcing WiFi reconnect");
+                        ED_wifi::WiFiService::forceReconnect();
+                        s_last_wifi_reconnect_time = now;
+                        s_mqtt_reconnect_attempts = 0;
+                    } else {
+                        int64_t remaining = WIFI_RECONNECT_COOLDOWN_SEC - (now - s_last_wifi_reconnect_time);
+                        ESP_LOGW(TAG, "WiFi cooldown active (%lld sec remaining), skipping WiFi reset", remaining);
+                    }
+                }
+
+                ED_MQTT::MqttClient::forceReconnect();
+            } else {
+                ESP_LOGW(TAG, "Reconnect already pending, skipping duplicate call");
+            }
+
             s_ping_fail_count = 0;
             s_ping_pending = false;
             return;
@@ -759,7 +792,31 @@ void MQTTdispatcher::publishInfo() {
             if (s_ping_failure_cb) s_ping_failure_cb();
             s_mqtt_ready = false;
             if (s_info_timer) xTimerStop(s_info_timer, 0);
-            ED_MQTT::MqttClient::forceReconnect();
+
+            // Multi-level recovery (same as above)
+            if (!s_reconnect_pending) {
+                s_reconnect_pending = true;
+                s_mqtt_reconnect_attempts++;
+                ESP_LOGW(TAG, "MQTT reconnect attempt #%d", s_mqtt_reconnect_attempts);
+
+                if (s_mqtt_reconnect_attempts >= MQTT_RECONNECT_THRESHOLD) {
+                    int64_t now = esp_timer_get_time() / 1000000;
+                    if (now - s_last_wifi_reconnect_time >= WIFI_RECONNECT_COOLDOWN_SEC) {
+                        ESP_LOGW(TAG, "Threshold reached, forcing WiFi reconnect");
+                        ED_wifi::WiFiService::forceReconnect();
+                        s_last_wifi_reconnect_time = now;
+                        s_mqtt_reconnect_attempts = 0;
+                    } else {
+                        int64_t remaining = WIFI_RECONNECT_COOLDOWN_SEC - (now - s_last_wifi_reconnect_time);
+                        ESP_LOGW(TAG, "WiFi cooldown active (%lld sec remaining), skipping WiFi reset", remaining);
+                    }
+                }
+
+                ED_MQTT::MqttClient::forceReconnect();
+            } else {
+                ESP_LOGW(TAG, "Reconnect already pending, skipping duplicate call");
+            }
+
             s_ping_fail_count = 0;
             s_ping_pending = false;
         } else {
@@ -769,6 +826,7 @@ void MQTTdispatcher::publishInfo() {
         s_last_ping_msg_id = msg_id;
         s_ping_pending = true;
         ESP_LOGD(TAG, "Info ping sent, msgID=%d", msg_id);
+        // Do NOT call success callback – wait for PUBACK
     }
 }
 
@@ -782,7 +840,12 @@ void MQTTdispatcher::handle_published_event(esp_mqtt_event_handle_t event) {
             ESP_LOGI(TAG, "Resetting fail count from %d to 0", s_ping_fail_count);
             s_ping_fail_count = 0;
         }
+        // Reset multi-level recovery counter on successful ack
+        if (s_mqtt_reconnect_attempts > 0) {
+            s_mqtt_reconnect_attempts = 0;
+        }
         if (s_ping_success_cb) s_ping_success_cb();
+        if (s_reconnect_pending) s_reconnect_pending = false;
     }
 }
 
@@ -794,28 +857,32 @@ void MQTTdispatcher::registerPingFailureCallback(PingFailureCallback cb) {
     s_ping_failure_cb = cb;
 }
 
+void MQTTdispatcher::resetMqttReconnectAttempts() {
+    s_mqtt_reconnect_attempts = 0;
+}
+
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
-  strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
-  s_config = config;
+    strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
+    s_config = config;
 
-  s_info_timer = xTimerCreate("info_loop", pdMS_TO_TICKS(10000), pdTRUE,
-                              nullptr, T_info_timer_callback);
-  if (!s_info_timer) {
-    ESP_LOGE(TAG, "xTimerCreate failed");
-    return ESP_FAIL;
-  }
+    s_info_timer = xTimerCreate("info_loop", pdMS_TO_TICKS(10000), pdTRUE,
+                                nullptr, T_info_timer_callback);
+    if (!s_info_timer) {
+        ESP_LOGE(TAG, "xTimerCreate failed");
+        return ESP_FAIL;
+    }
 
-  xTaskCreate(info_publisher_task, "info_pub", 8192, nullptr, 5,
-              &s_info_task_handle);
+    xTaskCreate(info_publisher_task, "info_pub", 8192, nullptr, 5,
+                &s_info_task_handle);
 
-  ESP_LOGI(TAG, "initialized, waiting for IP before starting MQTT");
-  return ESP_OK;
+    ESP_LOGI(TAG, "initialized, waiting for IP before starting MQTT");
+    return ESP_OK;
 }
 
 esp_err_t MQTTdispatcher::run() {
-  ED_wifi::WiFiService::subscribeToIPReady(on_ip_ready);
-  ESP_LOGI(TAG, "run() — MQTT will start once IP is ready");
-  return ESP_OK;
+    ED_wifi::WiFiService::subscribeToIPReady(on_ip_ready);
+    ESP_LOGI(TAG, "run() — MQTT will start once IP is ready");
+    return ESP_OK;
 }
 
 void MQTTdispatcher::on_ip_ready() {
@@ -843,15 +910,15 @@ void MQTTdispatcher::on_ip_ready() {
 }
 
 void MQTTdispatcher::registerJsonFieldProvider(JsonFieldProvider provider) {
-  if (!provider) {
-    ESP_LOGW(TAG, "Null JSON provider ignored");
-    return;
-  }
-  if (s_json_provider_count >= MAX_JSON_PROVIDERS) {
-    ESP_LOGE(TAG, "Too many JSON providers, max=%d", MAX_JSON_PROVIDERS);
-    return;
-  }
-  s_json_providers[s_json_provider_count++] = provider;
+    if (!provider) {
+        ESP_LOGW(TAG, "Null JSON provider ignored");
+        return;
+    }
+    if (s_json_provider_count >= MAX_JSON_PROVIDERS) {
+        ESP_LOGE(TAG, "Too many JSON providers, max=%d", MAX_JSON_PROVIDERS);
+        return;
+    }
+    s_json_providers[s_json_provider_count++] = provider;
 }
 
 } // namespace ED_MQTT_dispatcher

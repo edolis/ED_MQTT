@@ -1,12 +1,12 @@
 /**
 * @file main.cpp
-* @brief Dispatcher and OTA test using ED_OTA library with MQTT commands, PFREQ, and firmware info on boot.
+* @brief OTA test using ED_OTA library with MQTT commands, PFREQ, and firmware info on boot.
  *
  * @author Emanuele Dolis (emanuele.dolis@gmail.com)
  * @version GIT_VERSION: v1.1.3-4-gf0e7061-dirty
  * @date 2026-05-25
  * @submodules-start
- *   ED_WIFI : v1.0.0-1-g10b3d09
+ *   ED_WIFI : v1.1.0-0-ga015030
  * @submodules-end
  */
 

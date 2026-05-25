@@ -1,14 +1,17 @@
-# ED_MQTT Dispatcher – Full Documentation (Updated)
+# ED_MQTT Dispatcher – Full Documentation (with Multi‑Level Recovery)
 
 The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher for ESP‑IDF. It integrates with the `ED_MQTT` client, parses incoming messages (colon commands or JSON), routes them to registered command handlers, and includes a built‑in **health monitor** based on periodic diagnostic publishes with QoS 1 and PUBACK tracking.
 
+Additionally, it now implements **multi‑level recovery**: after a configurable number of consecutive MQTT reconnect failures, it triggers a WiFi reconnection (subject to a cooldown) to recover from deeper network issues.
+
 ## Table of Contents
-- [ED\_MQTT Dispatcher – Full Documentation (Updated)](#ed_mqtt-dispatcher--full-documentation-updated)
+- [ED\_MQTT Dispatcher – Full Documentation (with Multi‑Level Recovery)](#ed_mqtt-dispatcher--full-documentation-with-multilevel-recovery)
   - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
   - [Architecture Diagram](#architecture-diagram)
   - [Command Processing Flow](#command-processing-flow)
   - [Health Monitor \& Ping Callbacks](#health-monitor--ping-callbacks)
+  - [Multi‑Level Recovery (MQTT → WiFi)](#multilevel-recovery-mqtt--wifi)
   - [API Reference](#api-reference)
     - [MQTTdispatcher](#mqttdispatcher)
     - [ctrlCommand](#ctrlcommand)
@@ -35,7 +38,9 @@ The dispatcher solves three main problems:
 
 2. **Periodic device diagnostics** – Every N seconds (default 10, adjustable via `PFREQ`), publishes a JSON object to `devices/<id>/diag` containing uptime, IP, and custom fields from registered providers.
 
-3. **Health monitoring** – The diagnostic message is published with **QoS 1**. When the broker acknowledges it (`MQTT_EVENT_PUBLISHED`), the dispatcher clears the pending flag and resets the failure counter. If two consecutive pings are sent without receiving a PUBACK, or if a publish send error occurs twice, the dispatcher calls `ED_MQTT::MqttClient::forceReconnect()` and signals a failure callback. This ensures automatic recovery from silent broker stalls.
+3. **Health monitoring** – The diagnostic message is published with **QoS 1**. When the broker acknowledges it (`MQTT_EVENT_PUBLISHED`), the dispatcher clears the pending flag and resets the failure counter. If **two consecutive pings are sent without receiving a PUBACK**, or if a publish send error occurs twice, the dispatcher calls `ED_MQTT::MqttClient::forceReconnect()` and signals a failure callback.
+
+4. **Multi‑level recovery** – Each forced MQTT reconnect increments an internal counter. When the counter reaches a threshold (default 3), the dispatcher calls `ED_wifi::WiFiService::forceReconnect()`, but at most once every 5 minutes (cooldown). This resets the counter and allows the system to recover from severe network outages.
 
 The dispatcher uses static allocation, fixed callback arrays, and re‑registers MQTT event handlers on every connection (inside `on_mqtt_connected`) to survive full client teardown and reconnect.
 
@@ -45,47 +50,61 @@ The dispatcher uses static allocation, fixed callback arrays, and re‑registers
 
 ```mermaid
 flowchart TD
-    subgraph "MQTT Broker"
-        B[Broker]
-    end
+subgraph "MQTT Broker"
+B[Broker]
+end
 
-    subgraph "ESP32 Device"
-        MQTT[ED_MQTT::MqttClient]
-        DISP[ED_MQTT_dispatcher::MQTTdispatcher]
+subgraph "ESP32 Device"
+MQTT[ED_MQTT::MqttClient]
+DISP[ED_MQTT_dispatcher::MQTTdispatcher]
+WIFI[ED_wifi::WiFiService]
 
-        subgraph "Command Handling"
-            REG[GlobalCommandRegistry]
-            CMD1[OTA commands]
-            CMD2[User commands]
-        end
+subgraph "Command Handling"
+REG[GlobalCommandRegistry]
+CMD1[OTA commands]
+CMD2[User commands]
+end
 
-        subgraph "Health Monitor"
-            TIMER[Periodic Timer\n10s default]
-            PUB[publishInfo()\nQoS1 to /diag]
-            ACK[handle_published_event]
-            FAIL[Failure counter\n≥2 → forceReconnect]
-        end
+subgraph "Health Monitor"
+TIMER["Periodic Timer
+10s default"]
+PUB["publishInfo()
+QoS1 to /diag"]
+ACK[handle_published_event]
+FAIL["Failure counter
+≥2 → forceReconnect"]
+end
 
-        LED[LED Blink Task]
-    end
+subgraph "Multi-Level Recovery"
+COUNTER["Reconnect attempts
+threshold=3"]
+COOLDOWN["Cooldown 5 min"]
+WIFI_RECONNECT["WiFiService::forceReconnect"]
+end
 
-    B -- "subscribe to 'cmd'" --> DISP
-    DISP -- "publish diag (QoS1)" --> B
-    B -- "PUBACK" --> DISP
+LED[LED Blink Task]
+end
 
-    DISP --> REG
-    REG --> CMD1
-    REG --> CMD2
+B -- "subscribe to 'cmd'" --> DISP
+DISP -- "publish diag (QoS1)" --> B
+B -- "PUBACK" --> DISP
 
-    TIMER --> PUB
-    PUB --> ACK
-    ACK --> |success| FAIL
-    PUB --> |send error| FAIL
-    PUB --> |missing PUBACK| FAIL
-    FAIL --> |force reconnect| MQTT
-    MQTT --> DISP
+DISP --> REG
+REG --> CMD1
+REG --> CMD2
 
-    DISP -. "ping callbacks" .-> LED
+TIMER --> PUB
+PUB --> ACK
+PUB --> |send error| FAIL
+PUB --> |missing PUBACK| FAIL
+FAIL --> |force MQTT reconnect| COUNTER
+COUNTER --> |threshold reached| COOLDOWN
+COOLDOWN --> |cooldown expired| WIFI_RECONNECT
+WIFI_RECONNECT --> WIFI
+WIFI_RECONNECT --> |reset counter| COUNTER
+FAIL --> MQTT
+
+DISP -. "ping callbacks" .-> LED
 ```
 
 ---
@@ -130,7 +149,6 @@ The health monitor is the core resilience feature. It works as follows:
 6. If `esp_mqtt_client_publish()` returns an error, the failure counter also increments; after two such errors, reconnect is forced.
 7. When a PUBACK arrives, `handle_published_event()` clears `s_ping_pending`, resets the failure counter, and invokes the **success callback**.
 8. On MQTT disconnect, the timer is stopped and the failure callback is invoked to indicate lost connectivity.
-9. Reconnection is handled entirely by `ED_MQTT::MqttClient`. The dispatcher re‑registers its event handlers inside `on_mqtt_connected()` each time a new connection is established.
 
 **Callback Registration:**
 ```cpp
@@ -151,6 +169,29 @@ Callbacks are invoked from the MQTT event task context, so they must be fast and
 
 ---
 
+## Multi‑Level Recovery (MQTT → WiFi)
+
+The dispatcher maintains an internal counter `s_mqtt_reconnect_attempts`. Every time `publishInfo()` forces an MQTT reconnect (due to missing PUBACK or publish error), the counter is incremented.
+
+- When `s_mqtt_reconnect_attempts` reaches `MQTT_RECONNECT_THRESHOLD` (default 3), the dispatcher:
+  1. Checks the cooldown: `s_last_wifi_reconnect_time` and `WIFI_RECONNECT_COOLDOWN_SEC` (default 300 seconds = 5 minutes).
+  2. If the cooldown has expired, it calls `ED_wifi::WiFiService::forceReconnect()`.
+  3. Updates `s_last_wifi_reconnect_time` and resets `s_mqtt_reconnect_attempts` to 0.
+  4. If the cooldown is still active, it logs a warning and skips the WiFi reset.
+
+- The counter is also reset to 0 on:
+  - A successful MQTT connection (`on_mqtt_connected`).
+  - A successful PUBACK (`handle_published_event`).
+
+This ensures that:
+- The MQTT client recovers automatically from transient broker issues.
+- After 3 consecutive MQTT reconnect failures, the WiFi stack is reset (once every 5 minutes).
+- The router is not hammered if the broker is down but WiFi is fine.
+
+**Important:** This feature requires that `ED_wifi::WiFiService::forceReconnect()` is implemented (as described in the WiFi documentation).
+
+---
+
 ## API Reference
 
 ### MQTTdispatcher
@@ -166,6 +207,7 @@ All methods are **static**.
 | `void ackCommand(int64_t msgID, const char* cmdID, ackType result, const char* original)` | Sends an acknowledgment to `ack/<device_id>` topic. |
 | `void registerPingSuccessCallback(PingSuccessCallback cb)` | Registers a callback invoked on every successful PUBACK. |
 | `void registerPingFailureCallback(PingFailureCallback cb)` | Registers a callback invoked on publish errors, missed acks, or disconnect. |
+| `void resetMqttReconnectAttempts()` | Manually resets the internal MQTT reconnect counter (optional). |
 | `esp_mqtt_client_handle_t getClientHandle()` | Returns the underlying MQTT client handle. |
 
 **Diagnostic JSON Providers:**
@@ -417,7 +459,7 @@ The period affects both the diagnostic message rate and the health check interva
 - **ED_MQTT** – Wrapper around esp‑mqtt client.
 - **ED_S_JSON** – Static JSON builder (no dynamic allocation).
 - **ED_sys** – Provides device name, firmware version, uptime.
-- **ED_wifi** – Provides IP address and AP info.
+- **ED_wifi** – Provides IP address, AP info, and the `forceReconnect()` method.
 - **esp‑mqtt** – ESP‑IDF component (header `mqtt_client.h`).
 
 **CMakeLists.txt requirements:**
@@ -435,8 +477,9 @@ The ED_MQTT Dispatcher provides a robust, zero‑heap solution for:
 - Parsing and dispatching MQTT commands (colon or JSON).
 - Periodic device diagnostics with custom fields.
 - Application‑level health monitoring using QoS 1 publishes and PUBACK tracking.
-- Automatic reconnect after two consecutive failures (missing acks or send errors).
+- Automatic MQTT reconnect after two consecutive failures (missing acks or send errors).
+- Multi‑level recovery: after 3 MQTT reconnect attempts, a WiFi reset is triggered (once every 5 minutes) to recover from deep network issues.
 - Callback integration for visual feedback (LEDs) or other actions.
 
-The health monitor recovers from silent broker stalls by detecting missing PUBACKs and forcing a full client teardown and rebuild. The dispatcher re‑registers its event handlers on each connection, ensuring seamless recovery after broker restarts or network outages.
+The health monitor and multi‑level recovery together ensure that the device remains operational and reachable even after prolonged broker outages or WiFi disruptions.
 ```

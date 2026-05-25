@@ -17,6 +17,7 @@ static constexpr uint8_t MAX_OPT_PARAMS = 8;
 // Forward declarations
 class CommandRegistry;
 class GlobalCommandRegistry;
+class iCommandRunner;
 
 // ── Command parameter structure ──────────────────────────────────────
 struct OptParam {
@@ -95,6 +96,7 @@ private:
     const char* m_baseUrl = nullptr;
 };
 
+// ── Command subscriber interface ────────────────────────────────────
 class iCommandRunner {
 public:
     virtual void grabCommand(const char* commandID, const char* commandData,
@@ -105,13 +107,9 @@ public:
 // ── Main MQTT dispatcher ─────────────────────────────────────────────
 class MQTTdispatcher {
 public:
-// Callback types for ping status
-using PingSuccessCallback = void (*)(void);
-using PingFailureCallback = void (*)(void);
-
-static void registerPingSuccessCallback(PingSuccessCallback cb);
-static void registerPingFailureCallback(PingFailureCallback cb);
     using JsonFieldProvider = void (*)(ED_S_JSON::StaticJson& doc);
+    using PingSuccessCallback = void (*)(void);
+    using PingFailureCallback = void (*)(void);
 
     static esp_err_t initialize(esp_mqtt_client_config_t* config);
     static esp_err_t run();
@@ -123,12 +121,13 @@ static void registerPingFailureCallback(PingFailureCallback cb);
     static void ackCommand(int64_t reqMsgID, const char* commandID,
                            ackType ackResult, const char* originalCommand = nullptr);
 
-    // Health tracking: called on MQTT_EVENT_PUBLISHED
     static void handle_published_event(esp_mqtt_event_handle_t event);
+    static void registerPingSuccessCallback(PingSuccessCallback cb);
+    static void registerPingFailureCallback(PingFailureCallback cb);
+    static void resetMqttReconnectAttempts();
 
 private:
-static PingSuccessCallback s_ping_success_cb;
-static PingFailureCallback s_ping_failure_cb;
+static bool s_reconnect_pending;
     static void on_ip_ready();
     static void on_mqtt_connected(esp_mqtt_client_handle_t client);
     static void on_mqtt_data(esp_mqtt_client_handle_t client,
@@ -141,7 +140,6 @@ static PingFailureCallback s_ping_failure_cb;
     static bool parseCommand(const char* input, size_t inputLen,
                              char* cmdID, size_t cmdIDLen,
                              char* payload, size_t payloadLen);
-
     static void T_info_timer_callback(TimerHandle_t handle);
     static void info_publisher_task(void* param);
 
@@ -163,6 +161,16 @@ static PingFailureCallback s_ping_failure_cb;
     static bool s_ping_pending;
     static uint8_t s_ping_fail_count;
     static constexpr uint8_t PING_MAX_FAILURES = 2;
+
+    // Ping callbacks
+    static PingSuccessCallback s_ping_success_cb;
+    static PingFailureCallback s_ping_failure_cb;
+
+    // Multi-level recovery counters
+    static uint8_t s_mqtt_reconnect_attempts;
+    static int64_t s_last_wifi_reconnect_time;
+    static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
+    static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300; // 5 minutes
 };
 
 } // namespace ED_MQTT_dispatcher
