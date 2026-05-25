@@ -1,190 +1,276 @@
-// #region StdManifest
 /**
- * @file main_Dispatcher.cpp
- * @brief shown the use of Dispatcher, commands and OTA leveraging MQTT sent command to trigger and confirm partition as valid
- * Working with TSL (MQTT) and SSH (file transfer and directory queries)
+* @file main.cpp
+* @brief Dispatcher and OTA test using ED_OTA library with MQTT commands, PFREQ, and firmware info on boot.
  *
- * @author Emanuele Dolis (edoliscom@gmail.com)
- * @version GIT_VERSION: v1.0.0-0-dirty
- * @tagged as: SNTP-core
- * @commit hash: g5d100c9 [5d100c9e7fbf8030cd9e50ec7db3b7b6333dbee1]
- * @build ID: P20250910-154350-5d100c9
- *  @compiledSizeInfo begin
-
-    .iram0.text      85 874    .dram0.data  12 852
-    .flash.text     860 588    .dram0.bss   21 128
-    .flash.appdesc      256    ―――――――――――――――――――
-    .flash.rodata   146 972    total        33 980
-    ―――――――――――――――――――――――
-    subtotal        1 093 690
-
-    @compiledSizeInfo end
- * @date 2025-08-28
+ * @author Emanuele Dolis (emanuele.dolis@gmail.com)
+ * @version GIT_VERSION: v1.1.3-4-gf0e7061-dirty
+ * @date 2026-05-25
+ * @submodules-start
+ *   ED_WIFI : v1.0.0-1-g10b3d09
+ * @submodules-end
  */
 
-static const char *TAG = "ESP_main_loop";
+#include "esp_crt_bundle.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "led_strip.h"
+#include "mqtt_client.h"
+#include <cstdio>
+#include <cstring>
+#include <math.h>
 
-// #region BuildInfo
-namespace ED_SYSINFO {
-// compile time GIT status
-struct GIT_fwInfo {
-  static constexpr const char *GIT_VERSION = "v1.0.0.0-0-dirty";
-  static constexpr const char *GIT_TAG = "SNTP-core";
-  static constexpr const char *GIT_HASH = "g5d100c9";
-  static constexpr const char *FULL_HASH =
-      "5d100c9e7fbf8030cd9e50ec7db3b7b6333dbee1";
-  static constexpr const char *BUILD_ID = "P20250828-122422-5d100c9";
-};
-} // namespace ED_SYSINFO
-// #endregion
-// #endregion
-
-#include "ED_JSON.h"
-#include "ED_sysInfo.h"
-#include "ED_sysstd.h"
-#include "ED_wifi.h"
-#include "ED_mqtt.h"
 #include "ED_MQTT_dispatcher.h"
 #include "ED_OTA.h"
-#include <string.h>
+#include "ED_sys.h"
+#include "ED_wifi.h"
+#include "secrets.h"
 
-#ifdef DEBUG_BUILD
-#endif
-#include <map>
-#include <esp_log.h>
-#include <esp_ota_ops.h>
+#define BOARD_VARIANT_ESP32S3_ZERO
+#include "ed_board.h"
 
-using namespace ED_JSON;
-using namespace ED_SYSINFO;
-// using namespace ED_MQTT_dispatcher;
+static const char *TAG = "MAIN_OTA_TEST";
 
-class TestCmdReceiver: public ED_MQTT_dispatcher::CommandWithRegistry{
+#define NUM_LEDS 1
+#define BRIGHTNESS 30
 
-public:
+static led_strip_handle_t led_strip = nullptr;
 
+// MQTT health state
+static volatile bool g_mqtt_healthy = false;   // initially false (no ping yet)
 
-static void EXECCommand(ED_MQTT_dispatcher::ctrlCommand * ctrcomd){
-
-ESP_LOGI("TestCmdReceive>GrabCommandr", "executing cmd [%s] cmd Help [%s]", ctrcomd->cmdID.c_str(), ED_MQTT_dispatcher::ctrlCommand::toHelpString(*ctrcomd).c_str());
-
-};
-
- void init(){
-
-  ED_MQTT_dispatcher::ctrlCommand sdpiCmd("SDPI","Set data polling interval",
-    ED_MQTT_dispatcher::ctrlCommand::cmdScope::GLOBAL,{});
-
-sdpiCmd.funcPointer =
-    static_cast<void(*)(ED_MQTT_dispatcher::ctrlCommand*)>(&TestCmdReceiver::EXECCommand);;
-ESP_LOGI(TAG,"Step_ funcpointer is null? %d",sdpiCmd.funcPointer==nullptr);
-
-  registerCommand(sdpiCmd);
-};
-};
-
-// ED_MQTT_dispatcher::CommandRegistry TestCmdReceiver::registry;
-
-void check_ota_state_on_boot() {
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    ESP_LOGI(TAG,"Step_in check ota state");
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-        switch (ota_state) {
-            case ESP_OTA_IMG_PENDING_VERIFY:
-                ESP_LOGI(TAG, "OTA: Image is PENDING_VERIFY");
-                // Run your self-tests here, then either:
-                // On success:
-                esp_ota_mark_app_valid_cancel_rollback();
-                // On failure:
-                // esp_ota_mark_app_invalid_rollback_and_reboot();
-                break;
-            case ESP_OTA_IMG_VALID:
-                ESP_LOGI(TAG, "OTA: Image is VALID");
-                break;
-            case ESP_OTA_IMG_INVALID:
-                ESP_LOGW(TAG, "OTA: Image is INVALID");
-                break;
-            default:
-                ESP_LOGI(TAG, "OTA: Image state = %d", ota_state);
-                break;
-        }
+// ---------------------------------------------------------------------
+//   AP info provider
+// ---------------------------------------------------------------------
+static void wifiDiagProvider(ED_S_JSON::StaticJson& diagObj) {
+    auto apInfo = ED_wifi::WiFiService::getCurrentAPInfo();
+    if (apInfo.has_value()) {
+        diagObj.addString("dDGT", "DTW");
+        diagObj.addString("dS", "Y");
+        diagObj.addString("d_ssid", apInfo->ssid);
+        diagObj.addInt("d_rssi", apInfo->rssi);
     } else {
-        ESP_LOGE(TAG, "Failed to get OTA state");
+        diagObj.addString("dS", "N");
+        diagObj.addString("d_ssid", "none");
+        diagObj.addInt("d_rssi", 0);
     }
 }
 
-extern "C" void app_main(void) {
+// ---------------------------------------------------------------------
+// LED helpers
+// ---------------------------------------------------------------------
+static void configure_led(void) {
+    led_strip_config_t strip_config = {};
+    led_strip_rmt_config_t rmt_config = {};
 
-#ifdef DEBUG_BUILD
+    strip_config.strip_gpio_num = ED_ONBOARD_LED;
+    strip_config.max_leds = NUM_LEDS;
+    strip_config.led_model = LED_MODEL_WS2812;
+    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+    strip_config.flags.invert_out = false;
 
-#endif
-std::map<int, MacAddress> testMap;
+    rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+    rmt_config.resolution_hz = 10 * 1000 * 1000;
+    rmt_config.mem_block_symbols = 64;
+    rmt_config.flags.with_dma = false;
 
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    led_strip_clear(led_strip);
+}
 
+static void set_led(uint8_t red, uint8_t green, uint8_t blue) {
+    if (!led_strip) return;
+    led_strip_set_pixel(led_strip, 0, red, green, blue);
+    led_strip_refresh(led_strip);
+}
 
+static void clear_led() {
+    if (!led_strip) return;
+    led_strip_clear(led_strip);
+}
 
-  // char buffer[18] = "";
+// ---------------------------------------------------------------------
+// Rainbow colour mapping (patch 0‑9)
+// ---------------------------------------------------------------------
+static void hue_to_rgb(float hue, uint8_t *r, uint8_t *g, uint8_t *b) {
+    hue = fmodf(hue, 360.0f);
+    float s = 1.0f, v = 1.0f;
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(hue / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rp, gp, bp;
 
-  ED_JSON::JsonEncoder encoder;
-  ED_JSON::JsonEncoder encoderMAC;
+    if (hue < 60)       { rp = c; gp = x; bp = 0; }
+    else if (hue < 120) { rp = x; gp = c; bp = 0; }
+    else if (hue < 180) { rp = 0; gp = c; bp = x; }
+    else if (hue < 240) { rp = 0; gp = x; bp = c; }
+    else if (hue < 300) { rp = x; gp = 0; bp = c; }
+    else                { rp = c; gp = 0; bp = x; }
 
-  for (const auto &pair : ESP_MACstorage::getMacMap()) {
-    esp_mac_type_t type = pair.first;
-    const MacAddress &mac = pair.second;
+    *r = (uint8_t)((rp + m) * 255);
+    *g = (uint8_t)((gp + m) * 255);
+    *b = (uint8_t)((bp + m) * 255);
+}
 
-    char buffer[18];
-    std::string macStr = std::string(mac.toString(buffer, sizeof(buffer)));
+// ---------------------------------------------------------------------
+// LED blink task (reacts to MQTT health state)
+// ---------------------------------------------------------------------
+static void led_blink_task(void *arg) {
+    const char *version = ED_SYS::ESP_std::Firmware::version();
+    int patch = ED_SYS::ESP_std::Firmware::patchVersion();
 
-    encoderMAC.add(std::string(esp_mac_type_str[type]), macStr);
-  }
-  encoder.add("deviceMACs", encoderMAC);
-  encoder.add("intKey", 42);
-  encoder.add("boolKey", true);
-  encoder.add("nullKey", nullptr);
-  encoder.add("arrayKey", std::vector<std::string>{"item1", "item2", "item3"});
-static TestCmdReceiver crec;
-crec.init();
+    float hue = (patch % 10) * 36.0f;
+    uint8_t normal_r, normal_g, normal_b;
+    hue_to_rgb(hue, &normal_r, &normal_g, &normal_b);
 
-ED_OTA::OTAmanager otaUpdater;
+    ESP_LOGI(TAG, "Version %s (patch %d, hue %.0f°) -> R=%d G=%d B=%d",
+             version, patch, hue, normal_r, normal_g, normal_b);
 
-ED_SYSINFO::dump_ca_cert(ca_crt_start,ca_crt_end);
+    configure_led();
 
+    // Blink patterns
+    const TickType_t NORMAL_ON_MS  = pdMS_TO_TICKS(1000);
+    const TickType_t NORMAL_OFF_MS = pdMS_TO_TICKS(1000);
+    const TickType_t FAILURE_ON_MS  = pdMS_TO_TICKS(200);
+    const TickType_t FAILURE_OFF_MS = pdMS_TO_TICKS(200);
 
-ED_wifi::WiFiService::subscribeToIPReady([&]() {
-    ED_MQTT_dispatcher::MQTTdispatcher::initialize();
+    while (1) {
+        if (g_mqtt_healthy) {
+            // Normal mode: version color, 1s on/off
+            set_led(normal_r, normal_g, normal_b);
+            vTaskDelay(NORMAL_ON_MS);
+            clear_led();
+            vTaskDelay(NORMAL_OFF_MS);
+        } else {
+            // Failure mode: red, fast blink
+            set_led(255, 0, 0);
+            vTaskDelay(FAILURE_ON_MS);
+            clear_led();
+            vTaskDelay(FAILURE_OFF_MS);
+        }
+    }
+}
 
-    ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&crec);
-    ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&otaUpdater);
-  });
-  ED_wifi::WiFiService::launch();
+// ---------------------------------------------------------------------
+// MQTT health callbacks
+// ---------------------------------------------------------------------
+static void on_ping_success() {
+    ESP_LOGI(TAG, "MQTT ping success → normal LED pattern");
+    g_mqtt_healthy = true;
+}
 
-ESP_LOGI(TAG,"***App name: %s\n", ED_sysstd::ESP_std::fwPrjName());
-ESP_LOGI(TAG,"***Version: %s\n", ED_sysstd::ESP_std::fwVer());
-check_ota_state_on_boot();
+static void on_ping_failure() {
+    ESP_LOGW(TAG, "MQTT ping failure → red fast blink");
+    g_mqtt_healthy = false;
+}
 
-  // Optional hardware setup
-  // gpio_set_direction(LED_BUILTIN, GPIO_MODE_OUTPUT);
+// ---------------------------------------------------------------------
+// Publish firmware details on boot
+// ---------------------------------------------------------------------
+static void publish_firmware_info(void *arg) {
+    // Wait until MQTT client is ready
+    while (ED_MQTT_dispatcher::MQTTdispatcher::getClientHandle() == nullptr) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-#ifdef DEBUG_BUILD
+    ED_MQTT::MqttClient *client = ED_MQTT::MqttClient::getInstance();
+    if (!client) {
+        ESP_LOGE(TAG, "No MQTT client instance");
+        vTaskDelete(NULL);
+        return;
+    }
 
-#endif
+    const char *deviceID = ED_SYS::ESP_std::Device::mqttName();
+    const char *version  = ED_SYS::ESP_std::Firmware::version();
 
-  while (true) {
-    // shows the results of the first calls which will happen when network not
-    // initialized, afterwards calls will get froper feedback
-  // uint8_t mockMac[6] = {0x98, 0x3D, 0xAE, 0x41, 0x2F, 0x6C};
-  // // ESP_LOGI(TAG,"start test 1");
-  // MacAddress m(mockMac);
-  // // ESP_LOGI(TAG,"start test 2");
-  // testMap[0] = m;
-  // ESP_LOGI(TAG,"start test 3");
+    char simpleMsg[128];
+    snprintf(simpleMsg, sizeof(simpleMsg), "%s running %s", deviceID, version);
+    client->publish("info/firmware/simple", simpleMsg, 0, false);
 
-  // MacAddress mad=ESP_MACstorage::getMac(ESP_MAC_BASE);
-  // char buffer[18]="";
-  // ESP_LOGI(TAG,"start test %s", mad.toString(buffer,sizeof(buffer),':'));
-  // ESP_LOGI(TAG,"stdmqttname %s", ED_sysstd::ESP_std::mqttName());
+    char jsonBuf[512];
+    snprintf(jsonBuf, sizeof(jsonBuf),
+        "{"
+        "\"device\":\"%s\","
+        "\"project\":\"%s\","
+        "\"version\":\"%s\","
+        "\"tag\":\"%s\","
+        "\"major\":%d,"
+        "\"minor\":%d,"
+        "\"patch\":%d,"
+        "\"build\":%d,"
+        "\"hash_short\":\"%s\","
+        "\"hash_full\":\"%s\","
+        "\"build_id\":\"%s\","
+        "\"dirty\":%s"
+        "}",
+        deviceID,
+        ED_SYS::ESP_std::Firmware::prjName(),
+        version,
+        ED_SYS::ESP_std::Firmware::tag(),
+        ED_SYS::ESP_std::Firmware::majorVersion(),
+        ED_SYS::ESP_std::Firmware::minorVersion(),
+        ED_SYS::ESP_std::Firmware::patchVersion(),
+        ED_SYS::ESP_std::Firmware::buildNumber(),
+        ED_SYS::ESP_std::Firmware::shortHash(),
+        ED_SYS::ESP_std::Firmware::fullHash(),
+        ED_SYS::ESP_std::Firmware::buildId(),
+        ED_SYS::ESP_std::Firmware::isDirty() ? "true" : "false"
+    );
+    client->publish("info/firmware", jsonBuf, 0, false);
 
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    // ESP_LOGI(TAG, "JSON Output: %s", encoder.getJson().c_str());
-  }
+    ESP_LOGI(TAG, "Published firmware info");
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------
+extern "C" void app_main() {
+    ESP_LOGI(TAG, "Firmware version details:");
+    ESP_LOGI(TAG, "  Full version: %s", ED_SYS::ESP_std::Firmware::version());
+    ESP_LOGI(TAG, "  Tag:          %s", ED_SYS::ESP_std::Firmware::tag());
+    ESP_LOGI(TAG, "  Major:        %d", ED_SYS::ESP_std::Firmware::majorVersion());
+    ESP_LOGI(TAG, "  Minor:        %d", ED_SYS::ESP_std::Firmware::minorVersion());
+    ESP_LOGI(TAG, "  Patch:        %d", ED_SYS::ESP_std::Firmware::patchVersion());
+    ESP_LOGI(TAG, "  Build number: %d", ED_SYS::ESP_std::Firmware::buildNumber());
+    ESP_LOGI(TAG, "  Short hash:   %s", ED_SYS::ESP_std::Firmware::shortHash());
+    ESP_LOGI(TAG, "  Full hash:    %s", ED_SYS::ESP_std::Firmware::fullHash());
+    ESP_LOGI(TAG, "  Build ID:     %s", ED_SYS::ESP_std::Firmware::buildId());
+    ESP_LOGI(TAG, "  Dirty:        %s", ED_SYS::ESP_std::Firmware::isDirty() ? "yes" : "no");
+
+    // Start LED task (initially off because g_mqtt_healthy = false)
+    xTaskCreate(led_blink_task, "led_blink", 4096, NULL, 1, NULL);
+
+    ED_wifi::WiFiService::launch();
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = "mqtts://raspi00:8883";
+    mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+    mqtt_cfg.credentials.username = ED_MQTT_USERNAME;
+    mqtt_cfg.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
+    mqtt_cfg.credentials.authentication.password = ED_MQTT_PASSWORD;
+    mqtt_cfg.session.last_will.topic = "test";
+    mqtt_cfg.session.last_will.msg = "last will message";
+    mqtt_cfg.session.last_will.qos = 1;
+    mqtt_cfg.session.last_will.retain = true;
+    mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+
+    ED_MQTT_dispatcher::MQTTdispatcher::initialize(&mqtt_cfg);
+    ED_MQTT_dispatcher::MQTTdispatcher::registerJsonFieldProvider(wifiDiagProvider);
+    ED_MQTT_dispatcher::MQTTdispatcher::run();
+
+    // Register ping health callbacks
+    ED_MQTT_dispatcher::MQTTdispatcher::registerPingSuccessCallback(on_ping_success);
+    ED_MQTT_dispatcher::MQTTdispatcher::registerPingFailureCallback(on_ping_failure);
+
+    static ED_OTA::OTAmanager otaManager;
+
+    // Publish firmware info once MQTT is ready
+    xTaskCreate(publish_firmware_info, "fw_info_pub", 4096, NULL, 1, NULL);
+
+    ESP_LOGI(TAG, "System ready. MQTT dispatcher running. OTA manager active.");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }

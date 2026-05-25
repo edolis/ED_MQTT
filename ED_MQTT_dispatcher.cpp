@@ -36,6 +36,18 @@ MQTTdispatcher::JsonFieldProvider
 uint8_t MQTTdispatcher::s_json_provider_count = 0;
 char MQTTdispatcher::s_cached_ip[16] = "";
 
+// Health ping state
+int32_t MQTTdispatcher::s_last_ping_msg_id = 0;
+bool MQTTdispatcher::s_ping_pending = false;
+uint8_t MQTTdispatcher::s_ping_fail_count = 0;
+
+// MQTT client ready flag
+static bool s_mqtt_ready = false;
+
+// Ping callbacks
+MQTTdispatcher::PingSuccessCallback MQTTdispatcher::s_ping_success_cb = nullptr;
+MQTTdispatcher::PingFailureCallback MQTTdispatcher::s_ping_failure_cb = nullptr;
+
 //-------------------------------------------------------------
 
 // ── ctrlCommand helpers ─────────────────────────────────────────────
@@ -143,7 +155,7 @@ CommandWithRegistry::CommandWithRegistry(const char* regID, const char* briefDes
     GlobalCommandRegistry::instance().registerRegistry(regID, &registry, briefDesc);
 }
 
-// ── CommandWithRegistry::grabCommand (injects _msgID and _original) ──
+// ── CommandWithRegistry::grabCommand ────────────────────────────────
 void CommandWithRegistry::grabCommand(const char *commandID,
                                       const char *commandData,
                                       size_t /*dataLen*/,
@@ -155,7 +167,6 @@ void CommandWithRegistry::grabCommand(const char *commandID,
         return;
     }
 
-    // Convert msgID to string safely
     char msgIDstr[24];
     int len = snprintf(msgIDstr, sizeof(msgIDstr), "%lu", (uint32_t)msgID);
     if (len <= 0 || len >= (int)sizeof(msgIDstr)) {
@@ -163,35 +174,25 @@ void CommandWithRegistry::grabCommand(const char *commandID,
         strcpy(msgIDstr, "0");
     }
 
-    // Inject _msgID (use a dedicated key that won't be overwritten by flag parsing)
-    // First try to setParam, if fails then addParam
     if (!cmd->setParam("_msgID", msgIDstr)) {
         ESP_LOGI("CmdReg", "Adding _msgID param (setParam failed)");
         cmd->addParam("_msgID", msgIDstr);
     }
 
-    // Also store a second copy under a different key as a backup
     if (!cmd->setParam("_msgID_raw", msgIDstr)) {
         cmd->addParam("_msgID_raw", msgIDstr);
     }
 
-    // Verify that the parameter was stored correctly
-    const char *check = cmd->getParam("_msgID");
-
-    // Inject the original full command string
     char originalBuf[PARAM_VAL_LEN];
     snprintf(originalBuf, sizeof(originalBuf), "%s %s", commandID, commandData ? commandData : "");
     if (!cmd->setParam("_original", originalBuf))
         cmd->addParam("_original", originalBuf);
 
-    // Parse colon‑format flags: -key value
     const char *p = commandData;
     if (!p) p = "";
 
-    // Skip leading whitespace
     while (*p && isspace((unsigned char)*p)) ++p;
 
-    // First token = default value (if not a flag)
     if (*p && *p != '-') {
         const char *d0 = p;
         while (*p && !isspace((unsigned char)*p)) ++p;
@@ -204,11 +205,10 @@ void CommandWithRegistry::grabCommand(const char *commandID,
             cmd->addParam("_default", tmp);
     }
 
-    // Remaining tokens: -key [value]
     while (*p) {
         while (*p && isspace((unsigned char)*p)) ++p;
         if (*p != '-') break;
-        ++p; // skip '-'
+        ++p;
 
         const char *f0 = p;
         while (*p && isalnum((unsigned char)*p)) ++p;
@@ -228,21 +228,15 @@ void CommandWithRegistry::grabCommand(const char *commandID,
             memcpy(valbuf, v0, vlen);
         }
 
-        // Use addParam because the flag may not exist yet; we don't want to overwrite existing values.
-        // But setParam first to avoid duplicate if it already exists.
         if (!cmd->setParam(flagbuf, valbuf))
             cmd->addParam(flagbuf, valbuf);
     }
 
-    // Final sanity check for _msgID
-    const char *finalMsgID = cmd->getParam("_msgID");
-
-    // Execute the command
     if (cmd->funcPointer)
         cmd->funcPointer(cmd);
 }
 
-// ── GlobalCommandRegistry (singleton) ───────────────────────────────
+// ── GlobalCommandRegistry ───────────────────────────────────────────
 GlobalCommandRegistry &GlobalCommandRegistry::instance() {
   static GlobalCommandRegistry inst;
   return inst;
@@ -340,7 +334,7 @@ void GlobalCommandRegistry::getCommandHelp(const char *regID, const char *cmdID,
   }
 }
 
-// ── MQTTdispatcher implementation ────────────────────────────────────
+// ── MQTTdispatcher implementation ───────────────────────────────────
 
 esp_mqtt_client_handle_t MQTTdispatcher::getClientHandle() {
     SemaphoreHandle_t mutex = get_disp_mutex();
@@ -394,35 +388,60 @@ bool MQTTdispatcher::parseCommand(const char *input, size_t inputLen,
 }
 
 void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
-  static char topic_conn[64];
-  static char topic_info[64];
-  static bool built = false;
+    static char topic_conn[64];
+    static char topic_info[64];
+    static bool built = false;
 
-  if (!built) {
-    snprintf(topic_conn, sizeof topic_conn, "devices/connections/%s", s_mqtt_id);
-    snprintf(topic_info, sizeof topic_info, "devices/%s/diag", s_mqtt_id);
-    built = true;
-  }
+    if (!built) {
+        snprintf(topic_conn, sizeof topic_conn, "devices/connections/%s", s_mqtt_id);
+        snprintf(topic_info, sizeof topic_info, "devices/%s/diag", s_mqtt_id);
+        built = true;
+    }
 
-     SemaphoreHandle_t mutex = get_disp_mutex();
+    SemaphoreHandle_t mutex = get_disp_mutex();
     xSemaphoreTake(mutex, portMAX_DELAY);
     s_clHandle = client;
     xSemaphoreGive(mutex);
 
-  char msg[96];
-  int n = snprintf(msg, sizeof msg, "%s connects.", s_mqtt_id);
-  if (n < 0)
-    n = 0;
+    char msg[96];
+    int n = snprintf(msg, sizeof msg, "%s connects.", s_mqtt_id);
+    if (n < 0) n = 0;
 
-  esp_mqtt_client_publish(client, topic_conn, msg, n,
-                          ED_MQTT::MqttClient::MqttQoS::QOS1, true);
-  int sub_msg_id = esp_mqtt_client_subscribe(client, "cmd", 0);
-  ESP_LOGI(TAG, "Subscribed to 'cmd', msg_id=%d", sub_msg_id);
+    esp_mqtt_client_publish(client, topic_conn, msg, n,
+                            ED_MQTT::MqttClient::MqttQoS::QOS1, true);
+    int sub_msg_id = esp_mqtt_client_subscribe(client, "cmd", 0);
+    ESP_LOGI(TAG, "Subscribed to 'cmd', msg_id=%d", sub_msg_id);
 
-  static char info_buf[JSON_BUFFER_SIZE];
-  build_ping_json(info_buf, sizeof info_buf);
-  esp_mqtt_client_publish(client, topic_info, info_buf, strlen(info_buf),
-                          ED_MQTT::MqttClient::MqttQoS::QOS1, true);
+    static char info_buf[JSON_BUFFER_SIZE];
+    build_ping_json(info_buf, sizeof info_buf);
+    esp_mqtt_client_publish(client, topic_info, info_buf, strlen(info_buf),
+                            ED_MQTT::MqttClient::MqttQoS::QOS1, true);
+
+    // Reset health tracking
+    s_ping_pending = false;
+    s_ping_fail_count = 0;
+    s_last_ping_msg_id = 0;
+    s_mqtt_ready = true;
+
+    // Register MQTT event handlers (must be done for every new client)
+    esp_mqtt_client_register_event(client, MQTT_EVENT_PUBLISHED,
+        [](void*, esp_event_base_t, int32_t, void* event_data) {
+            MQTTdispatcher::handle_published_event((esp_mqtt_event_handle_t)event_data);
+        }, nullptr);
+
+    esp_mqtt_client_register_event(client, MQTT_EVENT_DISCONNECTED,
+        [](void*, esp_event_base_t, int32_t, void*) {
+            s_mqtt_ready = false;
+            if (s_info_timer) xTimerStop(s_info_timer, 0);
+            ESP_LOGW(TAG, "MQTT disconnected, info timer stopped");
+            if (s_ping_failure_cb) s_ping_failure_cb();
+        }, nullptr);
+
+    // Start the periodic info timer
+    if (s_info_timer) {
+        xTimerStart(s_info_timer, 0);
+        ESP_LOGI(TAG, "Info timer started after MQTT connect");
+    }
 }
 
 void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
@@ -440,42 +459,37 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
         ESP_LOGD(TAG, "✅ Parsed colon command: '%s', payload='%s'", cmdID, payload_buf);
 
         // HELP command handling
-if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
-    static char helpBuf[1024];
-    char arg1[CMD_ID_LEN] = {0};
-    char arg2[CMD_ID_LEN] = {0};
-    sscanf(payload_buf, "%15s %15s", arg1, arg2);
+        if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
+            static char helpBuf[1024];
+            char arg1[CMD_ID_LEN] = {0};
+            char arg2[CMD_ID_LEN] = {0};
+            sscanf(payload_buf, "%15s %15s", arg1, arg2);
 
-    if (arg2[0] != '\0') {
-        // HELP <registry> <command>
-        GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf, sizeof(helpBuf));
-    }
-    else if (arg1[0] != '\0') {
-        // HELP <registry>
-        GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf, sizeof(helpBuf));
-    }
-    else {
-        // No arguments: decide based on number of registries
-        uint8_t regCount = GlobalCommandRegistry::instance().getRegistryCount();
-        if (regCount == 1) {
-            // Only one registry – show its help directly
-            const char* regID = GlobalCommandRegistry::instance().getFirstRegistryID();
-            if (regID) {
-                GlobalCommandRegistry::instance().getRegistryHelp(regID, helpBuf, sizeof(helpBuf));
-            } else {
-                snprintf(helpBuf, sizeof(helpBuf), "Error: registry ID is null.");
+            if (arg2[0] != '\0') {
+                GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf, sizeof(helpBuf));
             }
-        } else {
-            // Multiple registries – show overview
-            GlobalCommandRegistry::instance().getHelpOverview(helpBuf, sizeof(helpBuf));
+            else if (arg1[0] != '\0') {
+                GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf, sizeof(helpBuf));
+            }
+            else {
+                uint8_t regCount = GlobalCommandRegistry::instance().getRegistryCount();
+                if (regCount == 1) {
+                    const char* regID = GlobalCommandRegistry::instance().getFirstRegistryID();
+                    if (regID) {
+                        GlobalCommandRegistry::instance().getRegistryHelp(regID, helpBuf, sizeof(helpBuf));
+                    } else {
+                        snprintf(helpBuf, sizeof(helpBuf), "Error: registry ID is null.");
+                    }
+                } else {
+                    GlobalCommandRegistry::instance().getHelpOverview(helpBuf, sizeof(helpBuf));
+                }
+            }
+
+            esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf, strlen(helpBuf), 0, 0);
+            return;
         }
-    }
 
-    esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf, strlen(helpBuf), 0, 0);
-    return;
-}
-
-        // ── PFREQ command: configure periodic ping interval ────────
+        // PFREQ command: configure periodic ping interval
         if (strcmp(cmdID, "PFREQ") == 0) {
             const char *arg = payload_buf;
             while (*arg && isspace((unsigned char)*arg)) ++arg;
@@ -491,9 +505,8 @@ if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
                     if (number == 0) {
                         disable = true;
                     } else {
-                        // move past digits
                         while (*arg && isdigit((unsigned char)*arg)) ++arg;
-                        unsigned long multiplier = 1;   // default = seconds
+                        unsigned long multiplier = 1;
                         char ch = *arg;
                         if (ch == 's' || ch == 'S') {
                             ++arg;
@@ -530,7 +543,6 @@ if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
                     if (xTimerChangePeriod(s_info_timer, new_period_ticks, 0) == pdPASS) {
                         ESP_LOGI(TAG, "PFREQ: Ping interval changed to %lu ms",
                                  (unsigned long)(new_period_ticks * portTICK_PERIOD_MS));
-                        // ensure timer is running
                         xTimerStart(s_info_timer, 0);
                         if (s_clHandle) {
                             char ack_msg[64];
@@ -546,7 +558,7 @@ if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
             } else {
                 ESP_LOGW(TAG, "PFREQ: Info timer not initialised");
             }
-            return;   // command handled, don’t pass to subscribers
+            return;
         }
 
         // Normal colon command – dispatch to subscribers
@@ -574,7 +586,6 @@ if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
 
 void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
                                          uint32_t cmdID) {
-  // ----- Step 1: try as single object with "cmd" and "data" -----
   ED_S_JSON::StaticJson decoder(json);
   if (decoder.isValid()) {
     const char *cmd = decoder.getString("cmd");
@@ -587,7 +598,7 @@ void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
     }
   }
 
-  // ----- Step 2: try as array of objects { "cmd":..., "data":... } -----
+  // try as array of objects
   const char *p = json;
   while ((p = strstr(p, "\"cmd\"")) != nullptr) {
     const char *cmd_start = strchr(p, ':');
@@ -653,7 +664,7 @@ void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
     if (n < 0) n = 0;
     if (n >= (int)sizeof ackbuf) n = (int)sizeof ackbuf - 1;
 
-    bool ok = s_mqtt->publish(topic_ack, ackbuf, 1, false);   // QoS1, not retained
+    bool ok = s_mqtt->publish(topic_ack, ackbuf, 1, false);
     if (!ok) {
         ESP_LOGE(TAG, "ackCommand publish failed");
     }
@@ -661,41 +672,26 @@ void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
 
 void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
     ED_S_JSON::StaticJson doc;
-
-    // Root object
     doc.beginObject();
-
-    // Core fields
     doc.addString("dDGT", "DTF");
     doc.addString("dS", "N");
     doc.addString("d_UPT", ED_SYS::ESP_std::Runtime::uptime());
-
-    // Diagnostics array
     doc.beginArray("diagnostics");
-
-    // Call each registered provider – each adds one object to the array
     for (uint8_t i = 0; i < s_json_provider_count; ++i) {
         if (s_json_providers[i]) {
-            // Start an anonymous object inside the array
             doc.beginObject();
-            // Provider adds its fields to this object
             s_json_providers[i](doc);
-            // Close the object
             doc.endObject();
         }
     }
+    doc.endArray();
+    doc.endObject();
 
-    doc.endArray();   // end diagnostics array
-    doc.endObject();  // end root object
-
-    // Copy the generated JSON to the output buffer
     const char* json_str = doc.toString();
     size_t needed = strlen(json_str) + 1;
-
     if (needed <= len) {
         memcpy(buf, json_str, needed);
     } else {
-        // Truncate safely if output buffer is too small (should not happen)
         strncpy(buf, json_str, len - 1);
         buf[len - 1] = '\0';
         ESP_LOGW(TAG, "build_ping_json truncated (%zu > %zu)", needed - 1, len - 1);
@@ -715,6 +711,29 @@ void MQTTdispatcher::info_publisher_task(void *) {
 }
 
 void MQTTdispatcher::publishInfo() {
+    if (!s_mqtt_ready) {
+        ESP_LOGD(TAG, "MQTT not ready, skipping publish");
+        return;
+    }
+
+    // Check for missing PUBACK from previous ping
+    if (s_ping_pending) {
+        s_ping_fail_count++;
+        ESP_LOGW(TAG, "Missing PUBACK for msgID=%d, fail count=%d/%d",
+                 s_last_ping_msg_id, s_ping_fail_count, PING_MAX_FAILURES);
+
+        if (s_ping_fail_count >= PING_MAX_FAILURES) {
+            ESP_LOGE(TAG, "Too many consecutive missed acks → forcing reconnect");
+            if (s_ping_failure_cb) s_ping_failure_cb();
+            s_mqtt_ready = false;
+            if (s_info_timer) xTimerStop(s_info_timer, 0);
+            ED_MQTT::MqttClient::forceReconnect();
+            s_ping_fail_count = 0;
+            s_ping_pending = false;
+            return;
+        }
+    }
+
     SemaphoreHandle_t mutex = get_disp_mutex();
     xSemaphoreTake(mutex, portMAX_DELAY);
     esp_mqtt_client_handle_t cl = s_clHandle;
@@ -731,20 +750,54 @@ void MQTTdispatcher::publishInfo() {
     static char buf[JSON_BUFFER_SIZE];
     build_ping_json(buf, sizeof buf);
 
-    // Use MqttClient wrapper to get client‑id property automatically
-    bool ok = s_mqtt->publish(topic_info, buf, 0, true);   // QoS0, retain
+    int msg_id = esp_mqtt_client_publish(cl, topic_info, buf, strlen(buf), 1, true);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "publishInfo send error (err=%d)", msg_id);
+        s_ping_fail_count++;
+        if (s_ping_fail_count >= PING_MAX_FAILURES) {
+            ESP_LOGE(TAG, "Publish errors → forcing reconnect");
+            if (s_ping_failure_cb) s_ping_failure_cb();
+            s_mqtt_ready = false;
+            if (s_info_timer) xTimerStop(s_info_timer, 0);
+            ED_MQTT::MqttClient::forceReconnect();
+            s_ping_fail_count = 0;
+            s_ping_pending = false;
+        } else {
+            if (s_ping_failure_cb) s_ping_failure_cb();
+        }
+    } else {
+        s_last_ping_msg_id = msg_id;
+        s_ping_pending = true;
+        ESP_LOGD(TAG, "Info ping sent, msgID=%d", msg_id);
+    }
+}
 
-    if (!ok)
-        ESP_LOGE(TAG, "publishInfo failed");
-    // else
-    //     ESP_LOGI(TAG, "publishInfo ok");
+void MQTTdispatcher::handle_published_event(esp_mqtt_event_handle_t event) {
+    if (!s_mqtt_ready) return;
+    if (!event || !s_ping_pending) return;
+    if (event->msg_id == s_last_ping_msg_id) {
+        ESP_LOGD(TAG, "PUBACK received for msgID=%d", event->msg_id);
+        s_ping_pending = false;
+        if (s_ping_fail_count > 0) {
+            ESP_LOGI(TAG, "Resetting fail count from %d to 0", s_ping_fail_count);
+            s_ping_fail_count = 0;
+        }
+        if (s_ping_success_cb) s_ping_success_cb();
+    }
+}
+
+void MQTTdispatcher::registerPingSuccessCallback(PingSuccessCallback cb) {
+    s_ping_success_cb = cb;
+}
+
+void MQTTdispatcher::registerPingFailureCallback(PingFailureCallback cb) {
+    s_ping_failure_cb = cb;
 }
 
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
   strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
   s_config = config;
 
-  // ── 10-second timer (default) ─────────────────────────────────
   s_info_timer = xTimerCreate("info_loop", pdMS_TO_TICKS(10000), pdTRUE,
                               nullptr, T_info_timer_callback);
   if (!s_info_timer) {
@@ -766,30 +819,27 @@ esp_err_t MQTTdispatcher::run() {
 }
 
 void MQTTdispatcher::on_ip_ready() {
-   // Cache IP for later use in info publisher
     strncpy(s_cached_ip, ED_SYS::ESP_std::Device::curIP(), sizeof(s_cached_ip) - 1);
     s_cached_ip[sizeof(s_cached_ip) - 1] = '\0';
 
-  ESP_LOGI(TAG, "IP ready — creating MQTT client");
-  s_mqtt = ED_MQTT::MqttClient::create(s_config);
-  if (!s_mqtt) {
-    ESP_LOGE(TAG, "MqttClient::create failed");
-    return;
-  }
-  s_clHandle = s_mqtt->getHandle();
+    ESP_LOGI(TAG, "IP ready — creating MQTT client");
+    s_mqtt = ED_MQTT::MqttClient::create(s_config);
+    if (!s_mqtt) {
+        ESP_LOGE(TAG, "MqttClient::create failed");
+        return;
+    }
+    s_clHandle = s_mqtt->getHandle();
 
-  ESP_LOGI(TAG, "Waiting 3 seconds for MQTT connection...");
-  vTaskDelay(pdMS_TO_TICKS(3000));
+    s_mqtt_ready = false;
 
-  int sub_id = esp_mqtt_client_subscribe(s_clHandle, "cmd", 0);
-  ESP_LOGI(TAG, "Direct subscription to 'cmd', msg_id=%d", sub_id);
+    s_mqtt->registerConnectedCallback(on_mqtt_connected);
+    s_mqtt->registerDataCallback(on_mqtt_data);
 
-  s_mqtt->registerConnectedCallback(on_mqtt_connected);
-  s_mqtt->registerDataCallback(on_mqtt_data);
+    ESP_LOGI(TAG, "Waiting 3 seconds for MQTT connection...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
-  // ── Start the periodic timer ─────────────────────────────────
-  if (s_info_timer)
-    xTimerStart(s_info_timer, 0);
+    int sub_id = esp_mqtt_client_subscribe(s_clHandle, "cmd", 0);
+    ESP_LOGI(TAG, "Direct subscription to 'cmd', msg_id=%d", sub_id);
 }
 
 void MQTTdispatcher::registerJsonFieldProvider(JsonFieldProvider provider) {
