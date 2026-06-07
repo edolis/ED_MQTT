@@ -1,3 +1,4 @@
+// ED_MQTT_dispatcher.h
 #pragma once
 
 #include "mqtt_client.h"
@@ -127,7 +128,7 @@ public:
     static void resetMqttReconnectAttempts();
 
 private:
-static bool s_reconnect_pending;
+    static bool s_reconnect_pending;
     static void on_ip_ready();
     static void on_mqtt_connected(esp_mqtt_client_handle_t client);
     static void on_mqtt_data(esp_mqtt_client_handle_t client,
@@ -171,6 +172,9 @@ static bool s_reconnect_pending;
     static int64_t s_last_wifi_reconnect_time;
     static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
     static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300; // 5 minutes
+
+    // Dead‑man monitor (good PUBACK)
+    static int64_t s_last_good_ping_time;
 };
 
 } // namespace ED_MQTT_dispatcher
