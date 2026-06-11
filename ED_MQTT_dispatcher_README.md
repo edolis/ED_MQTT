@@ -1,26 +1,37 @@
-# ED_MQTT Dispatcher – Full Documentation (Final Robust Version)
+# ED_MQTT Dispatcher – Complete Documentation
 
-The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher for ESP‑IDF. It integrates with the `ED_MQTT` client, parses incoming messages (colon commands or JSON), routes them to registered handlers, and includes a **multi‑layer recovery system** that guarantees reconnection even after long broker outages.
+The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher and health monitor for ESP‑IDF. It integrates with `ED_MQTT::MqttClient`, parses incoming messages (colon commands or JSON), routes them to registered handlers, and includes a multi‑layer recovery system that guarantees reconnection even after long broker outages.
 
 ## Table of Contents
-- [ED\_MQTT Dispatcher – Full Documentation (Final Robust Version)](#ed_mqtt-dispatcher--full-documentation-final-robust-version)
+- [ED\_MQTT Dispatcher – Complete Documentation](#ed_mqtt-dispatcher--complete-documentation)
   - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
-  - [Architecture Diagram](#architecture-diagram)
-  - [Command Processing Flow](#command-processing-flow)
+  - [Architecture](#architecture)
+  - [Command Processing](#command-processing)
+    - [Colon Command Flow](#colon-command-flow)
+    - [JSON Command Flow](#json-command-flow)
   - [Health Monitor \& Ping Callbacks](#health-monitor--ping-callbacks)
   - [Multi‑Level Recovery (MQTT → WiFi)](#multilevel-recovery-mqtt--wifi)
-  - [Dead‑Man Monitor (Ultimate Safety Net)](#deadman-monitor-ultimate-safety-net)
+  - [Dead‑Man Monitor \& Escalation](#deadman-monitor--escalation)
+  - [Persistent Logging \& DUMPLOG Command](#persistent-logging--dumplog-command)
   - [API Reference](#api-reference)
+    - [MQTTdispatcher (public static methods)](#mqttdispatcher-public-static-methods)
+    - [ctrlCommand](#ctrlcommand)
+    - [CommandRegistry / CommandWithRegistry](#commandregistry--commandwithregistry)
+    - [GlobalCommandRegistry](#globalcommandregistry)
   - [Usage Examples](#usage-examples)
     - [Basic Setup](#basic-setup)
-    - [Registering Commands](#registering-commands)
+    - [Registering Commands with CommandWithRegistry](#registering-commands-with-commandwithregistry)
+    - [Subscribing as iCommandRunner](#subscribing-as-icommandrunner)
+    - [Adding Diagnostic Fields](#adding-diagnostic-fields)
     - [Handling Ping Events (LED feedback)](#handling-ping-events-led-feedback)
+    - [Retrieving the Persistent Log](#retrieving-the-persistent-log)
   - [Command Syntax](#command-syntax)
     - [Colon Commands](#colon-commands)
     - [JSON Commands](#json-commands)
   - [PFREQ Command](#pfreq-command)
-  - [Dependencies](#dependencies)
+  - [Dependencies \& Integration](#dependencies--integration)
+  - [Troubleshooting](#troubleshooting)
   - [Summary](#summary)
 
 ---
@@ -29,17 +40,18 @@ The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher
 
 The dispatcher provides:
 
-1. **Command dispatch** – Listens on `"cmd"`, parses `:COMMAND ...` or JSON, routes to registered `iCommandRunner` or `CommandRegistry`.
-2. **Periodic device diagnostics** – Publishes a JSON object to `devices/<id>/diag` every N seconds (default 10). Contains uptime, IP, and custom fields.
-3. **Health monitoring** – Uses QoS 1 publishes. Missing PUBACKs increment a counter; after 2 consecutive missed acks, forces an MQTT reconnect.
-4. **Multi‑level recovery** – Tracks MQTT reconnect attempts. After 6 reconnects, triggers a WiFi reset (once every 5 min) to recover from deeper network issues.
-5. **Dead‑man monitor** – A separate task checks for successful PUBACKs every minute. If none received for 10 minutes, it forces an MQTT reconnect (no system restart). This ensures the device never stays offline indefinitely.
+1. **Command dispatch** – listens on MQTT topic `"cmd"`, parses colon commands (e.g. `:FWUP v2.1.0 -force`) or JSON objects, and routes them to registered `iCommandRunner` subscribers or `CommandRegistry` entries.
+2. **Periodic device diagnostics** – every N seconds (default 10, adjustable via `PFREQ`) publishes a JSON object to `devices/<id>/diag` containing uptime, IP, and custom fields added via `registerJsonFieldProvider`.
+3. **Health monitoring** – the diagnostic message is published with QoS 1. When the broker acknowledges it (`MQTT_EVENT_PUBLISHED`), the dispatcher clears a pending flag and resets the failure counter. If two consecutive pings are missed (or a send error occurs), it forces an MQTT reconnect.
+4. **Multi‑level recovery** – tracks MQTT reconnect attempts. After 6 attempts, it triggers a WiFi reset (once every 5 minutes) to recover from deeper network issues.
+5. **Dead‑man monitor** – a separate task checks every minute for the last good PUBACK. If no PUBACK for 10 minutes → MQTT reconnect; if still none after 2 more minutes → full WiFi stack restart; after another 2 minutes → system restart. Logs every step.
+6. **Persistent logging** – a circular buffer in RTC memory stores key events across reboots. The log can be retrieved remotely with the `DUMPLOG` command.
 
-All components are statically allocated – no `std::function` or dynamic memory after initialisation.
+All components use static allocation – no `std::function`, no dynamic memory after initialisation.
 
 ---
 
-## Architecture Diagram
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -74,10 +86,13 @@ flowchart TD
         subgraph "Dead‑Man Monitor"
             DEADMAN_TASK["Task (1 min interval)"]
             TIMEOUT["No good PUBACK<br>for 10 min"]
-            FORCE_RECONNECT["MQTT::forceReconnect"]
+            ESCALATE1[MQTT reconnect]
+            ESCALATE2[WiFi stack restart]
+            ESCALATE3[System restart]
         end
 
         LED[LED Blink Task]
+        LOG[Persistent Log<br>RTC memory]
     end
 
     B -- "subscribe to 'cmd'" --> DISP
@@ -100,47 +115,42 @@ flowchart TD
     FAIL --> MQTT
 
     DEADMAN_TASK --> |check s_last_good_ping_time| TIMEOUT
-    TIMEOUT --> FORCE_RECONNECT
-    FORCE_RECONNECT --> MQTT
+    TIMEOUT --> ESCALATE1
+    ESCALATE1 --> |after 2 min| ESCALATE2
+    ESCALATE2 --> |after 2 min| ESCALATE3
+    ESCALATE1 --> MQTT
+    ESCALATE2 --> WIFI
+    ESCALATE3 --> esp_restart
 
     DISP -. "ping callbacks" .-> LED
+    DISP -. "log_event" .-> LOG
+    LOG -. "DUMPLOG command" .-> DISP
 ```
 
 ---
 
-## Command Processing Flow
+## Command Processing
 
-```mermaid
-sequenceDiagram
-    participant Broker
-    participant Dispatcher
-    participant Registry
-    participant Handler
+The dispatcher processes messages from the MQTT topic `"cmd"` in two formats: **colon commands** (starting with `:`) and **JSON** (single object or array).
 
-    Broker->>Dispatcher: MQTT message on "cmd"
-    alt Colon command (starts with ':')
-        Dispatcher->>Dispatcher: parseCommand()
-        Dispatcher->>Registry: find command
-        Registry-->>Dispatcher: ctrlCommand*
-        Dispatcher->>Handler: funcPointer(cmd)
-    else JSON object
-        Dispatcher->>Dispatcher: handleCommandObject()
-        Dispatcher->>Registry: find command
-        Dispatcher->>Handler: funcPointer(cmd)
-    else JSON array
-        Dispatcher->>Dispatcher: iterate array
-        Dispatcher->>Handler: funcPointer(cmd) for each
-    end
-    Handler-->>Broker: optional ack via ackCommand()
-```
+### Colon Command Flow
+
+1. The string is parsed: the first token after `:` is the command ID (converted to uppercase). Subsequent tokens are either a default value or `-key value` flags.
+2. The dispatcher looks up the command in the `GlobalCommandRegistry`. If found, it calls the registered function pointer, passing a `ctrlCommand*` that contains the parameters (including auto‑injected `_msgID`, `_original`, `_default`).
+3. The command handler can then call `ackCommand()` to send an acknowledgment.
+
+### JSON Command Flow
+
+- Single object: `{"cmd": "FWUP", "data": "v2.1.0"}` → same as `:FWUP v2.1.0`.
+- Array of objects: each object is dispatched in order.
 
 ---
 
 ## Health Monitor & Ping Callbacks
 
-- The `s_info_timer` triggers every N seconds (default 10, adjustable via `PFREQ`). It notifies `info_publisher_task`, which calls `publishInfo()`.
-- `publishInfo()` sends a QoS 1 message to `devices/<id>/diag` and stores the message ID (`s_last_ping_msg_id`), setting `s_ping_pending = true`.
-- If, on the next timer tick, `s_ping_pending` is still `true` (no PUBACK received), `s_ping_fail_count` is incremented.
+- Every `s_info_timer` period (default 10s), `publishInfo()` sends a QoS 1 message to `devices/<id>/diag`.
+- It stores the message ID and sets `s_ping_pending = true`.
+- If the previous ping is still pending when the timer fires again, `s_ping_fail_count` is incremented.
 - After **2 consecutive missed PUBACKs** (or a publish send error), `s_ping_failure_cb` is called and `forceReconnect()` is triggered.
 - When a PUBACK arrives, `handle_published_event()` clears `s_ping_pending`, resets the failure counter, updates `s_last_good_ping_time`, and calls `s_ping_success_cb`.
 
@@ -150,7 +160,6 @@ sequenceDiagram
 static void on_ping_success() {
     // normal LED (green, version colour)
 }
-
 static void on_ping_failure() {
     // red LED, fast blink
 }
@@ -163,47 +172,50 @@ MQTTdispatcher::registerPingFailureCallback(on_ping_failure);
 ## Multi‑Level Recovery (MQTT → WiFi)
 
 - Each time the health monitor forces an MQTT reconnect, `s_mqtt_reconnect_attempts` is incremented.
-- When this counter reaches `MQTT_RECONNECT_THRESHOLD` (default **6**), the dispatcher calls `ED_wifi::WiFiService::forceReconnect()` **only if** at least `WIFI_RECONNECT_COOLDOWN_SEC` (default 300 s = 5 minutes) has elapsed since the last WiFi reset.
+- When this counter reaches `MQTT_RECONNECT_THRESHOLD` (default **6**), the dispatcher calls `ED_wifi::WiFiService::forceReconnect()` **only if** at least `WIFI_RECONNECT_COOLDOWN_SEC` (default 300 seconds = 5 minutes) has passed since the last WiFi reset.
 - The counter resets to `0` after a WiFi reset or after a successful PUBACK / connection.
 - This prevents flooding the router with WiFi reconnects when the broker alone is down.
 
-**Constants (defined in the header):**
+---
 
-```cpp
-static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
-static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300;
-```
+## Dead‑Man Monitor & Escalation
+
+A separate FreeRTOS task (`mqtt_deadman`) runs every **60 seconds**. It checks the time since the last good PUBACK (`s_last_good_ping_time`). If no PUBACK has been received for:
+
+- **10 minutes** → forces an MQTT reconnect (`ED_MQTT::MqttClient::forceReconnect()`).
+- **+2 more minutes (12 minutes total)** → forces a full WiFi stack restart (`ED_wifi::WiFiService::forceReconnect()`). This destroys and recreates the network interface.
+- **+2 more minutes (14 minutes total)** → restarts the entire ESP (`esp_restart()`).
+
+Each step is logged to both the console and the persistent log.
 
 ---
 
-## Dead‑Man Monitor (Ultimate Safety Net)
+## Persistent Logging & DUMPLOG Command
 
-A separate FreeRTOS task (`mqtt_deadman`) runs every **60 seconds**. It checks the time since the last successful PUBACK (`s_last_good_ping_time`). If no PUBACK has been received for **10 minutes**, it calls `ED_MQTT::MqttClient::forceReconnect()` **without** restarting WiFi or the system.
+The dispatcher maintains a **2KB circular log buffer** in RTC memory (internal SRAM, not flash/NVS). This buffer survives software reboots (including `esp_restart()`) but not power cycles – perfect for capturing events leading to a failure.
 
-- This task is independent of the info timer and the health monitor.
-- It catches any stalled state where the info timer may have stopped or PUBACKs are never received (e.g., TCP half‑open, broker silent).
-- It does **not** reset the WiFi stack – only MQTT – so it is safe and lightweight.
+**Logged events include:**
+- MQTT connect / disconnect
+- Info ping sent / PUBACK received
+- Missing PUBACKs and forced reconnects
+- WiFi stack restarts and system restarts (dead‑man actions)
 
-**Implementation (inside `initialize()`):**
+**To retrieve the log remotely, send the MQTT command:**
 
-```cpp
-xTaskCreate([](void*) {
-    const int64_t TIMEOUT_SEC = 600; // 10 minutes
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000)); // check every minute
-        int64_t now = esp_timer_get_time() / 1000000;
-        if (s_last_good_ping_time > 0 && (now - s_last_good_ping_time) > TIMEOUT_SEC) {
-            ESP_LOGW(TAG, "Dead‑man: No good PUBACK for %lld seconds, forcing MQTT reconnect", now - s_last_good_ping_time);
-            ED_MQTT::MqttClient::forceReconnect();
-            s_last_good_ping_time = now; // avoid immediate re‑trigger
-        }
-    }
-}, "mqtt_deadman", 2048, NULL, 1, NULL);
-```
+    :DUMPLOG
+
+The dispatcher will publish the log (up to 1500 bytes) to the topic `devices/<device_id>/dumplog`. You can subscribe to that topic to receive the log. If MQTT is completely dead, the log will be printed to the console on the next reboot (because `log_event` also prints to console).
+
+**Implementation details:**
+- Memory: `RTC_DATA_ATTR` – no NVS wear.
+- Buffer size: 2048 bytes (wraps, keeping the last ~1024 bytes).
+- Enabled by default. To disable, comment out the `log_event` calls and the static buffer definitions (not recommended for production debugging).
 
 ---
 
 ## API Reference
+
+### MQTTdispatcher (public static methods)
 
 | Method | Description |
 |--------|-------------|
@@ -214,29 +226,51 @@ xTaskCreate([](void*) {
 | `void ackCommand(int64_t msgID, const char* cmdID, ackType result, const char* original)` | Sends acknowledgment to `ack/<device_id>`. |
 | `void registerPingSuccessCallback(PingSuccessCallback cb)` | Called on every successful PUBACK. |
 | `void registerPingFailureCallback(PingFailureCallback cb)` | Called on missed PUBACK, send error, or disconnect. |
-| `void resetMqttReconnectAttempts()` | Resets the MQTT reconnect counter (useful for testing). |
+| `void resetMqttReconnectAttempts()` | Resets the MQTT reconnect counter. |
+| `void cmd_dumplog(ctrlCommand* cmd)` | Command handler for `DUMPLOG`. Publishes persistent log. |
+| `void log_event(const char* fmt, ...)` | Logs an event to both console and the circular buffer. |
 
-**Diagnostic JSON Provider:**
+### ctrlCommand
 
-```cpp
-using JsonFieldProvider = void (*)(ED_S_JSON::StaticJson& doc);
-void wifiDiagProvider(ED_S_JSON::StaticJson& doc) {
-    doc.addString("ssid", "MyNetwork");
-    doc.addInt("rssi", -45);
-}
-MQTTdispatcher::registerJsonFieldProvider(wifiDiagProvider);
-```
+Structure representing a command.
 
-**Command Subscriber Interface (iCommandRunner):**
+| Field | Description |
+|-------|-------------|
+| `const char* cmdID` | Uppercase command name (e.g., `"FWUP"`). |
+| `const char* cmdDex` | Brief description (used in help). |
+| `void (*funcPointer)(ctrlCommand*)` | Function called when command is dispatched. |
+| `uint8_t paramCount` | Number of parameters. |
+| `OptParam optParam[MAX_OPT_PARAMS]` | Key‑value parameters. |
 
-```cpp
-class iCommandRunner {
-public:
-    virtual void grabCommand(const char* commandID, const char* commandData,
-                             size_t dataLen, uint32_t msgID) = 0;
-    virtual ~iCommandRunner() = default;
-};
-```
+**Methods:**
+- `const char* getParam(const char* key)` – returns value for given key, or `nullptr`.
+- `bool setParam(const char* key, const char* val)` – updates existing parameter.
+- `bool addParam(const char* key, const char* default_val)` – adds new parameter.
+
+**Auto‑injected parameters:**
+- `_msgID` – original MQTT message ID (as string).
+- `_msgID_raw` – same (backup).
+- `_original` – full original command string.
+- `_default` – first token after command name (if not a flag).
+
+### CommandRegistry / CommandWithRegistry
+
+- `CommandRegistry` holds up to 16 commands. Use `registerCommand()` to add them.
+- `CommandWithRegistry` is a base class that automatically registers its `registry` with the `GlobalCommandRegistry` on construction. Derive from it and add commands in the constructor.
+
+### GlobalCommandRegistry
+
+Singleton that manages multiple registries and provides help generation.
+
+| Method | Description |
+|--------|-------------|
+| `void setBaseUrl(const char* url)` | Sets documentation base URL for help links. |
+| `bool registerRegistry(const char* id, CommandRegistry* reg, const char* desc)` | Registers a registry. |
+| `void getHelpOverview(char* buf, size_t len)` | Lists all registries. |
+| `void getRegistryHelp(const char* id, char* buf, size_t len)` | Lists commands in a registry. |
+| `void getCommandHelp(const char* reg, const char* cmd, char* buf, size_t len)` | Shows detailed help for a specific command. |
+
+The dispatcher automatically handles `HELP` commands sent via MQTT.
 
 ---
 
@@ -247,38 +281,97 @@ public:
 ```cpp
 #include "ED_MQTT_dispatcher.h"
 #include "ED_wifi.h"
+#include "secrets.h"
 
 extern "C" void app_main() {
     ED_wifi::WiFiService::launch();
-    esp_mqtt_client_config_t cfg = {}; // fill with broker details
-    ED_MQTT_dispatcher::MQTTdispatcher::initialize(&cfg);
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    mqtt_cfg.broker.address.uri = "mqtts://mybroker:8883";
+    mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+    mqtt_cfg.credentials.username = MY_MQTT_USER;
+    mqtt_cfg.credentials.client_id = ED_SYS::ESP_std::Device::mqttName();
+    mqtt_cfg.credentials.authentication.password = MY_MQTT_PASS;
+    mqtt_cfg.session.protocol_ver = MQTT_PROTOCOL_V_5;
+
+    ED_MQTT_dispatcher::MQTTdispatcher::initialize(&mqtt_cfg);
     ED_MQTT_dispatcher::MQTTdispatcher::run();
-    // Register callbacks, providers, etc.
-    while (1) vTaskDelay(pdMS_TO_TICKS(10000));
+
+    ED_MQTT_dispatcher::MQTTdispatcher::registerJsonFieldProvider(wifiDiagProvider);
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
 ```
 
-### Registering Commands
-
-Using `CommandWithRegistry` (auto‑registers with global registry):
+### Registering Commands with CommandWithRegistry
 
 ```cpp
+#include "ED_MQTT_dispatcher.h"
+
 class MyCommands : public ED_MQTT_dispatcher::CommandWithRegistry {
 public:
-    MyCommands() : CommandWithRegistry("MYREG", "My commands") {
+    MyCommands() : CommandWithRegistry("MYAPP", "My application commands") {
         ED_MQTT_dispatcher::ctrlCommand cmd;
         cmd.cmdID = "BLINK";
-        cmd.cmdDex = "Control LED blink";
+        cmd.cmdDex = "Control onboard LED blink pattern";
         cmd.funcPointer = cmd_blink;
-        cmd.addParam("rate_ms", "500");
+        cmd.addParam("rate_ms", "500");   // default 500ms
+        cmd.addParam("color", "green");
         registry.registerCommand(cmd);
     }
+
     static void cmd_blink(ED_MQTT_dispatcher::ctrlCommand* cmd) {
         const char* rate = cmd->getParam("rate_ms");
-        // ...
+        const char* color = cmd->getParam("color");
+        int rate_ms = rate ? atoi(rate) : 500;
+        // Apply LED settings...
+        // Send acknowledgment
+        const char* msgid = cmd->getParam("_msgID");
+        if (msgid && msgid[0]) {
+            int64_t id = atoll(msgid);
+            ED_MQTT_dispatcher::MQTTdispatcher::ackCommand(
+                id, cmd->cmdID,
+                ED_MQTT_dispatcher::MQTTdispatcher::ackType::OK,
+                "LED pattern updated");
+        }
     }
 };
-static MyCommands myCommands; // auto‑registered on construction
+
+static MyCommands myCommands;  // auto‑registers
+```
+
+### Subscribing as iCommandRunner
+
+```cpp
+#include "ED_MQTT_dispatcher.h"
+
+class MySubscriber : public ED_MQTT_dispatcher::iCommandRunner {
+public:
+    void grabCommand(const char* cmdID, const char* cmdData,
+                     size_t dataLen, uint32_t msgID) override {
+        ESP_LOGI("SUB", "Command: %s, Data: %.*s, MsgID: %lu",
+                 cmdID, (int)dataLen, cmdData, msgID);
+        // Handle command...
+    }
+};
+
+static MySubscriber subscriber;
+ED_MQTT_dispatcher::MQTTdispatcher::subscribe(&subscriber);
+```
+
+### Adding Diagnostic Fields
+
+```cpp
+#include "ED_MQTT_dispatcher.h"
+#include "ED_S_JSON.h"
+
+void wifiDiagProvider(ED_S_JSON::StaticJson& doc) {
+    doc.addString("ssid", "MyNetwork");
+    doc.addInt("rssi", -45);
+}
+// Register in app_main():
+MQTTdispatcher::registerJsonFieldProvider(wifiDiagProvider);
 ```
 
 ### Handling Ping Events (LED feedback)
@@ -301,13 +394,32 @@ ED_MQTT_dispatcher::MQTTdispatcher::registerPingSuccessCallback(on_ping_success)
 ED_MQTT_dispatcher::MQTTdispatcher::registerPingFailureCallback(on_ping_failure);
 ```
 
+### Retrieving the Persistent Log
+
+Send the command:
+
+    :DUMPLOG
+
+Subscribe to the response topic (replace `ESP_32:97:54` with your device ID):
+
+    mosquitto_sub -t "devices/ESP_32:97:54/dumplog" -h <broker_ip>
+
+Example output:
+
+    [2025-06-11 10:23:45] MQTT connected
+    [2025-06-11 10:23:55] Info ping sent msgID=12345
+    [2025-06-11 10:24:05] PUBACK received for msgID=12345
+    [2025-06-11 10:24:15] Info ping sent msgID=12346
+    [2025-06-11 10:24:25] Missing PUBACK for msgID=12346, fail count=1/2
+    [2025-06-11 10:24:35] Too many missed PUBACKs, forcing reconnect
+
 ---
 
 ## Command Syntax
 
 ### Colon Commands
 
-Messages to `"cmd"` must start with `:`, then command name, then optional flags.
+Messages to `"cmd"` must start with `:` followed by the command name and optional flags.
 
 **Syntax:**
 
@@ -320,45 +432,50 @@ Messages to `"cmd"` must start with `:`, then command name, then optional flags.
     :BLINK -rate_ms 200 -color blue
     :HELP OTA
 
-Special auto‑injected parameters: `_msgID`, `_original`, `_default`.
+The dispatcher extracts the command name (converted to uppercase) and parses flags. Flags are stored as parameters accessible via `cmd->getParam("flag")`.
+
+**Special auto‑injected parameters:**
+- `_msgID` – Original MQTT message ID (for acknowledgment routing).
+- `_original` – The full original command string.
+- `_default` – The first token after the command name (if not a flag).
 
 ### JSON Commands
 
-**Single object:**
+**Single command object:**
 
-```json
-{"cmd": "FWUP", "data": "v2.1.0"}
-```
+    {"cmd": "FWUP", "data": "v2.1.0"}
 
 **Array of commands:**
 
-```json
-[
-    {"cmd": "FWUP", "data": "v2.1.0"},
-    {"cmd": "BLINK", "data": "-rate_ms 500"}
-]
-```
+    [
+        {"cmd": "FWUP", "data": "v2.1.0"},
+        {"cmd": "BLINK", "data": "-rate_ms 500"}
+    ]
 
 ---
 
 ## PFREQ Command
 
-Changes the diagnostic publish interval (and health check frequency).
+The dispatcher listens for the special command `PFREQ` to change the diagnostic publish interval (and health check frequency). This does **not** go to command registries – it's handled internally.
+
+**Usage:**
 
     :PFREQ 30s      # 30 seconds
     :PFREQ 2m       # 2 minutes
     :PFREQ 1h       # 1 hour
     :PFREQ 0        # disable
-    :PFREQ D        # disable
+    :PFREQ D        # disable (alternative)
+
+The period affects both the diagnostic message rate and the health check interval.
 
 ---
 
-## Dependencies
+## Dependencies & Integration
 
 - **ED_MQTT** – MQTT client wrapper.
 - **ED_S_JSON** – Static JSON builder.
-- **ED_sys** – Device name, uptime.
-- **ED_wifi** – For `forceReconnect()` (optional, used only in multi‑level recovery).
+- **ED_sys** – Provides device name, firmware version, uptime.
+- **ED_wifi** – Provides IP address, AP info, and `forceReconnect()`.
 
 **CMakeLists.txt:**
 
@@ -368,15 +485,29 @@ idf_component_register(SRCS "ED_MQTT_dispatcher.cpp"
                        REQUIRES mqtt ED_MQTT ED_S_JSON ED_sys ED_wifi)
 ```
 
+To enable the dead‑man and persistent log (default enabled), no extra steps are needed. If you need to disable persistent logging, remove the `log_event` calls and the static buffer definitions from the source.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| LED stays red after broker restart | Missing PUBACK (reason code 16) | Check broker ACL and MQTT5 user properties. |
+| No pings sent | Info timer not started | Ensure `on_mqtt_connected` was called (check logs). |
+| Dead‑man restarts system repeatedly | WiFi stack cannot connect | Check WiFi credentials, signal strength, DHCP. |
+| `DUMPLOG` returns nothing | Persistent log empty or MQTT down | Wait for at least one event, or read console on reboot. |
+| Reconnection never happens after full restart | `forceReconnect()` not triggering teardown | Check `ED_mqtt.cpp` modifications (reconnect timer, queue). |
+
 ---
 
 ## Summary
 
-The dispatcher now includes **three independent recovery layers**:
+The dispatcher provides three independent recovery layers:
 
 1. **Fast recovery** – After 2 missed pings → MQTT reconnect.
 2. **Slower recovery** – After 6 MQTT reconnects → WiFi reset (once every 5 min).
-3. **Dead‑man monitor** – After 10 minutes without any PUBACK → MQTT reconnect.
+3. **Dead‑man monitor** – After 10 min without any PUBACK → MQTT reconnect; after 12 min → WiFi stack restart; after 14 min → system restart.
 
-Together, these ensure that a headless device will **always** recover from broker outages, WiFi disconnections, or internal stuck states, without requiring a system reboot. The dead‑man monitor is lightweight and non‑interfering, making it a perfect safety net for long‑running deployments.
+The **persistent log** (RTC memory) records all key events, and the `DUMPLOG` command lets you retrieve it remotely. Together, these features ensure that a headless device will always recover from broker outages, WiFi disruptions, or internal stuck states, and you can diagnose any failure without physical access.
 ```

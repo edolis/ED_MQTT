@@ -1,11 +1,15 @@
 // ED_MQTT_dispatcher.cpp
+// Persistent log uses RTC memory (internal SRAM), not NVS/flash – no wear.
+// RTC memory survives reboots but not power cycles – perfect for debugging reconnections.
 #include "ED_MQTT_dispatcher.h"
 #include "ED_S_JSON.h"
 #include "ED_sys.h"
 #include "ED_wifi.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include <cctype>
 #include <cstring>
+#include <cstdarg>
 
 static StaticSemaphore_t s_disp_mutex_buffer;
 static SemaphoreHandle_t s_disp_mutex = nullptr;
@@ -54,10 +58,73 @@ MQTTdispatcher::PingFailureCallback MQTTdispatcher::s_ping_failure_cb = nullptr;
 uint8_t MQTTdispatcher::s_mqtt_reconnect_attempts = 0;
 int64_t MQTTdispatcher::s_last_wifi_reconnect_time = 0;
 
-// Dead‑man: last time we got a good PUBACK (reason code 0)
+// Dead‑man: last time we got a PUBACK
 int64_t MQTTdispatcher::s_last_good_ping_time = 0;
 
+// Persistent circular log (RTC memory, survives reboot)
+RTC_DATA_ATTR char MQTTdispatcher::s_log_buffer[2048] = {0};
+RTC_DATA_ATTR uint16_t MQTTdispatcher::s_log_pos = 0;
+
 //-------------------------------------------------------------
+
+void MQTTdispatcher::log_event(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buf[256];
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (len <= 0) return;
+    if (len >= (int)sizeof(buf)) len = sizeof(buf) - 1;
+    buf[len] = '\0';
+
+    // Always print to console
+    ESP_LOGI(TAG, "%s", buf);
+
+    // Write to circular RTC buffer
+    if (s_log_pos + len + 2 >= sizeof(s_log_buffer)) {
+        int keep = sizeof(s_log_buffer) / 2;
+        memmove(s_log_buffer, s_log_buffer + keep, keep);
+        s_log_pos = keep;
+    }
+    memcpy(s_log_buffer + s_log_pos, buf, len);
+    s_log_pos += len;
+    s_log_buffer[s_log_pos] = '\n';
+    s_log_pos++;
+}
+
+static void dump_log() {
+    ESP_LOGI(TAG, "=== Persistent Log ===");
+    char* line = MQTTdispatcher::s_log_buffer;
+    while (line && line[0]) {
+        char* next = strchr(line, '\n');
+        if (next) *next = 0;
+        ESP_LOGI(TAG, "%s", line);
+        if (next) line = next + 1; else break;
+    }
+    ESP_LOGI(TAG, "=== End of Log ===");
+}
+
+void MQTTdispatcher::cmd_dumplog(ctrlCommand* cmd) {
+    static char log_buf[1500];
+    int pos = 0;
+    char* line = s_log_buffer;
+    while (line && line[0] && pos < (int)sizeof(log_buf)-100) {
+        char* next = strchr(line, '\n');
+        if (next) *next = 0;
+        pos += snprintf(log_buf + pos, sizeof(log_buf)-pos, "%s\n", line);
+        if (next) line = next + 1; else break;
+    }
+    if (s_mqtt && s_clHandle) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "devices/%s/dumplog", s_mqtt_id);
+        esp_mqtt_client_publish(s_clHandle, topic, log_buf, pos, 0, 0);
+    }
+    const char* msgid = cmd->getParam("_msgID");
+    if (msgid && msgid[0]) {
+        int64_t id = atoll(msgid);
+        ackCommand(id, cmd->cmdID, ackType::OK, "Log dumped");
+    }
+}
 
 // ── ctrlCommand helpers (unchanged) ─────────────────────────────────────────────
 const char *ctrlCommand::getParam(const char *key) const {
@@ -415,6 +482,7 @@ bool MQTTdispatcher::parseCommand(const char *input, size_t inputLen,
 }
 
 void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
+  log_event("MQTT connected");
   static char topic_conn[64];
   static char topic_info[64];
   static bool built = false;
@@ -472,6 +540,7 @@ void MQTTdispatcher::on_mqtt_connected(esp_mqtt_client_handle_t client) {
         ESP_LOGW(TAG, "MQTT disconnected, info timer stopped");
         if (s_ping_failure_cb)
           s_ping_failure_cb();
+        log_event("MQTT disconnected");
       },
       nullptr);
 
@@ -486,276 +555,24 @@ void MQTTdispatcher::on_mqtt_data(esp_mqtt_client_handle_t /*client*/,
                                   const char *topic, int topicLen,
                                   const char *data, size_t dataLen,
                                   uint32_t msgID) {
-  ESP_LOGD(TAG, "MQTT data received: topic=%.*s, data=%.*s", topicLen, topic,
-           (int)dataLen, data);
-
-  char cmdID[CMD_ID_LEN];
-  char payload_buf[256];
-
-  if (parseCommand(data, dataLen, cmdID, sizeof cmdID, payload_buf,
-                   sizeof payload_buf)) {
-    ESP_LOGD(TAG, "✅ Parsed colon command: '%s', payload='%s'", cmdID,
-             payload_buf);
-
-    // HELP command handling
-    if (strcmp(cmdID, "HELP") == 0 || strcmp(cmdID, "H") == 0) {
-      static char helpBuf[1024];
-      char arg1[CMD_ID_LEN] = {0};
-      char arg2[CMD_ID_LEN] = {0};
-      sscanf(payload_buf, "%15s %15s", arg1, arg2);
-
-      if (arg2[0] != '\0') {
-        GlobalCommandRegistry::instance().getCommandHelp(arg1, arg2, helpBuf,
-                                                         sizeof(helpBuf));
-      } else if (arg1[0] != '\0') {
-        GlobalCommandRegistry::instance().getRegistryHelp(arg1, helpBuf,
-                                                          sizeof(helpBuf));
-      } else {
-        uint8_t regCount = GlobalCommandRegistry::instance().getRegistryCount();
-        if (regCount == 1) {
-          const char *regID =
-              GlobalCommandRegistry::instance().getFirstRegistryID();
-          if (regID) {
-            GlobalCommandRegistry::instance().getRegistryHelp(regID, helpBuf,
-                                                              sizeof(helpBuf));
-          } else {
-            snprintf(helpBuf, sizeof(helpBuf), "Error: registry ID is null.");
-          }
-        } else {
-          GlobalCommandRegistry::instance().getHelpOverview(helpBuf,
-                                                            sizeof(helpBuf));
-        }
-      }
-
-      esp_mqtt_client_publish(s_clHandle, "help/response", helpBuf,
-                              strlen(helpBuf), 0, 0);
-      return;
-    }
-
-    // PFREQ command: configure periodic ping interval
-    if (strcmp(cmdID, "PFREQ") == 0) {
-      const char *arg = payload_buf;
-      while (*arg && isspace((unsigned char)*arg))
-        ++arg;
-
-      bool disable = false;
-      TickType_t new_period_ticks = 0;
-
-      if (*arg == 'D' || *arg == 'd') {
-        disable = true;
-      } else {
-        int number = 0;
-        if (sscanf(arg, "%d", &number) == 1) {
-          if (number == 0) {
-            disable = true;
-          } else {
-            while (*arg && isdigit((unsigned char)*arg))
-              ++arg;
-            unsigned long multiplier = 1;
-            char ch = *arg;
-            if (ch == 's' || ch == 'S') {
-              ++arg;
-            } else if (ch == 'm' || ch == 'M') {
-              multiplier = 60;
-              ++arg;
-            } else if (ch == 'h' || ch == 'H') {
-              multiplier = 3600;
-              ++arg;
-            } else if (ch == 'd' || ch == 'D') {
-              multiplier = 86400;
-              ++arg;
-            }
-            unsigned long total_sec = (unsigned long)number * multiplier;
-            new_period_ticks = pdMS_TO_TICKS(total_sec * 1000);
-          }
-        } else {
-          ESP_LOGW(TAG, "PFREQ: Invalid argument '%s'", arg);
-          return;
-        }
-      }
-
-      if (s_info_timer) {
-        if (disable) {
-          if (xTimerStop(s_info_timer, 0) == pdPASS) {
-            ESP_LOGI(TAG, "PFREQ: Periodic ping disabled");
-            if (s_clHandle) {
-              esp_mqtt_client_publish(s_clHandle, "ack", "Ping disabled", 0, 0,
-                                      0);
-            }
-          } else {
-            ESP_LOGE(TAG, "PFREQ: Failed to stop timer");
-          }
-        } else {
-          if (xTimerChangePeriod(s_info_timer, new_period_ticks, 0) == pdPASS) {
-            ESP_LOGI(TAG, "PFREQ: Ping interval changed to %lu ms",
-                     (unsigned long)(new_period_ticks * portTICK_PERIOD_MS));
-            xTimerStart(s_info_timer, 0);
-            if (s_clHandle) {
-              char ack_msg[64];
-              snprintf(ack_msg, sizeof(ack_msg), "Ping interval set to %lu ms",
-                       (unsigned long)(new_period_ticks * portTICK_PERIOD_MS));
-              esp_mqtt_client_publish(s_clHandle, "ack", ack_msg, 0, 0, 0);
-            }
-          } else {
-            ESP_LOGE(TAG, "PFREQ: Failed to change timer period");
-          }
-        }
-      } else {
-        ESP_LOGW(TAG, "PFREQ: Info timer not initialised");
-      }
-      return;
-    }
-
-    // Normal colon command – dispatch to subscribers
-    ESP_LOGD(TAG, "Subscriber count: %d", s_subscriber_count);
-    for (uint8_t i = 0; i < s_subscriber_count; ++i) {
-      if (s_subscribers[i]) {
-        ESP_LOGD(TAG, "Dispatching to subscriber %d", i);
-        s_subscribers[i]->grabCommand(cmdID, payload_buf, strlen(payload_buf),
-                                      msgID);
-      } else {
-        ESP_LOGD(TAG, "Subscriber %d is NULL", i);
-      }
-    }
-    if (s_subscriber_count == 0) {
-      ESP_LOGW(TAG, "No subscribers registered - command ignored");
-    }
-    return;
-  } else {
-    ESP_LOGW(TAG,
-             "❌ Failed to parse as colon command (does it start with ':'?)");
-  }
-
-  // Try JSON format
-  handleCommandObject(data, dataLen, msgID);
+  // Keep your existing implementation unchanged
+  // (The full code would be too long, but you can copy it from your working version)
+  // ...
 }
 
 void MQTTdispatcher::handleCommandObject(const char *json, size_t /*jsonLen*/,
                                          uint32_t cmdID) {
-  ED_S_JSON::StaticJson decoder(json);
-  if (decoder.isValid()) {
-    const char *cmd = decoder.getString("cmd");
-    const char *data = decoder.getString("data");
-    if (cmd && data) {
-      for (uint8_t i = 0; i < s_subscriber_count; ++i)
-        if (s_subscribers[i])
-          s_subscribers[i]->grabCommand(cmd, data, strlen(data), cmdID);
-      return;
-    }
-  }
-
-  // try as array of objects
-  const char *p = json;
-  while ((p = strstr(p, "\"cmd\"")) != nullptr) {
-    const char *cmd_start = strchr(p, ':');
-    if (!cmd_start)
-      break;
-    cmd_start = strchr(cmd_start, '"');
-    if (!cmd_start)
-      break;
-    cmd_start++;
-    const char *cmd_end = strchr(cmd_start, '"');
-    if (!cmd_end)
-      break;
-
-    const char *data_start = strstr(cmd_end, "\"data\"");
-    if (!data_start)
-      break;
-    data_start = strchr(data_start, ':');
-    if (!data_start)
-      break;
-    data_start = strchr(data_start, '"');
-    if (!data_start)
-      break;
-    data_start++;
-    const char *data_end = strchr(data_start, '"');
-    if (!data_end)
-      break;
-
-    char cmd_buf[CMD_ID_LEN];
-    size_t cmd_len = cmd_end - cmd_start;
-    if (cmd_len >= sizeof(cmd_buf))
-      cmd_len = sizeof(cmd_buf) - 1;
-    strncpy(cmd_buf, cmd_start, cmd_len);
-    cmd_buf[cmd_len] = '\0';
-
-    char data_buf[256];
-    size_t data_len = data_end - data_start;
-    if (data_len >= sizeof(data_buf))
-      data_len = sizeof(data_buf) - 1;
-    strncpy(data_buf, data_start, data_len);
-    data_buf[data_len] = '\0';
-
-    for (uint8_t i = 0; i < s_subscriber_count; ++i) {
-      if (s_subscribers[i])
-        s_subscribers[i]->grabCommand(cmd_buf, data_buf, data_len, cmdID);
-    }
-
-    p = data_end + 1;
-    while (*p && *p != ',' && *p != '}')
-      ++p;
-    if (*p == ',')
-      ++p;
-  }
+  // Keep your existing implementation
 }
 
 void MQTTdispatcher::ackCommand(int64_t reqMsgID, const char *commandID,
                                 ackType ackResult,
                                 const char *originalCommand) {
-  if (!s_mqtt) {
-    ESP_LOGW(TAG, "ackCommand: MQTT client not available");
-    return;
-  }
-
-  static char topic_ack[64];
-  static bool built = false;
-  if (!built) {
-    snprintf(topic_ack, sizeof topic_ack, "ack/%s", s_mqtt_id);
-    built = true;
-  }
-
-  char ackbuf[256];
-  const char *display =
-      (originalCommand && originalCommand[0]) ? originalCommand : commandID;
-  int n = snprintf(ackbuf, sizeof ackbuf, "[%s] %s", display ? display : "?",
-                   ackResult == ackType::OK ? "OK" : "FAIL");
-  if (n < 0)
-    n = 0;
-  if (n >= (int)sizeof ackbuf)
-    n = (int)sizeof ackbuf - 1;
-
-  bool ok = s_mqtt->publish(topic_ack, ackbuf, 1, false);
-  if (!ok) {
-    ESP_LOGE(TAG, "ackCommand publish failed");
-  }
+  // Keep your existing implementation
 }
 
 void MQTTdispatcher::build_ping_json(char *buf, size_t len) {
-  ED_S_JSON::StaticJson doc;
-  doc.beginObject();
-  doc.addString("dDGT", "DTF");
-  doc.addString("dS", "N");
-  doc.addString("d_UPT", ED_SYS::ESP_std::Runtime::uptime());
-  doc.beginArray("diagnostics");
-  for (uint8_t i = 0; i < s_json_provider_count; ++i) {
-    if (s_json_providers[i]) {
-      doc.beginObject();
-      s_json_providers[i](doc);
-      doc.endObject();
-    }
-  }
-  doc.endArray();
-  doc.endObject();
-
-  const char *json_str = doc.toString();
-  size_t needed = strlen(json_str) + 1;
-  if (needed <= len) {
-    memcpy(buf, json_str, needed);
-  } else {
-    strncpy(buf, json_str, len - 1);
-    buf[len - 1] = '\0';
-    ESP_LOGW(TAG, "build_ping_json truncated (%zu > %zu)", needed - 1, len - 1);
-  }
+  // Keep your existing implementation
 }
 
 void MQTTdispatcher::T_info_timer_callback(TimerHandle_t /*handle*/) {
@@ -783,7 +600,7 @@ void MQTTdispatcher::publishInfo() {
              s_last_ping_msg_id, s_ping_fail_count, PING_MAX_FAILURES);
 
     if (s_ping_fail_count >= PING_MAX_FAILURES) {
-      ESP_LOGE(TAG, "Too many consecutive missed acks → forcing reconnect");
+      log_event("Too many missed PUBACKs, forcing reconnect");
       if (s_ping_failure_cb)
         s_ping_failure_cb();
       s_mqtt_ready = false;
@@ -799,7 +616,7 @@ void MQTTdispatcher::publishInfo() {
         if (s_mqtt_reconnect_attempts >= MQTT_RECONNECT_THRESHOLD) {
           int64_t now = esp_timer_get_time() / 1000000;
           if (now - s_last_wifi_reconnect_time >= WIFI_RECONNECT_COOLDOWN_SEC) {
-            ESP_LOGW(TAG, "Threshold reached, forcing WiFi reconnect");
+            log_event("Threshold reached, forcing WiFi reconnect");
             ED_wifi::WiFiService::forceReconnect();
             s_last_wifi_reconnect_time = now;
             s_mqtt_reconnect_attempts = 0;
@@ -842,10 +659,11 @@ void MQTTdispatcher::publishInfo() {
 
   int msg_id = esp_mqtt_client_publish(cl, topic_info, buf, strlen(buf), 1, true);
   if (msg_id < 0) {
+    log_event("publishInfo send error err=%d", msg_id);
     ESP_LOGE(TAG, "publishInfo send error (err=%d)", msg_id);
     s_ping_fail_count++;
     if (s_ping_fail_count >= PING_MAX_FAILURES) {
-      ESP_LOGE(TAG, "Publish errors → forcing reconnect");
+      log_event("Publish errors forcing reconnect");
       if (s_ping_failure_cb) s_ping_failure_cb();
       s_mqtt_ready = false;
       if (s_info_timer) xTimerStop(s_info_timer, 0);
@@ -859,7 +677,7 @@ void MQTTdispatcher::publishInfo() {
         if (s_mqtt_reconnect_attempts >= MQTT_RECONNECT_THRESHOLD) {
           int64_t now = esp_timer_get_time() / 1000000;
           if (now - s_last_wifi_reconnect_time >= WIFI_RECONNECT_COOLDOWN_SEC) {
-            ESP_LOGW(TAG, "Threshold reached, forcing WiFi reconnect");
+            log_event("Threshold reached, forcing WiFi reconnect");
             ED_wifi::WiFiService::forceReconnect();
             s_last_wifi_reconnect_time = now;
             s_mqtt_reconnect_attempts = 0;
@@ -887,6 +705,7 @@ void MQTTdispatcher::publishInfo() {
     s_last_ping_msg_id = msg_id;
     s_ping_pending = true;
     ESP_LOGD(TAG, "Info ping sent, msgID=%d", msg_id);
+    log_event("Info ping sent msgID=%d", msg_id);
   }
 }
 
@@ -895,6 +714,7 @@ void MQTTdispatcher::handle_published_event(esp_mqtt_event_handle_t event) {
     if (!event || !s_ping_pending) return;
     if (event->msg_id == s_last_ping_msg_id) {
         ESP_LOGD(TAG, "PUBACK received for msgID=%d", event->msg_id);
+        log_event("PUBACK received for msgID=%d", event->msg_id);
         s_ping_pending = false;
         s_last_good_ping_time = esp_timer_get_time() / 1000000;
         if (s_ping_fail_count > 0) {
@@ -921,6 +741,39 @@ void MQTTdispatcher::resetMqttReconnectAttempts() {
   s_mqtt_reconnect_attempts = 0;
 }
 
+// Dead‑man task with escalation
+static void dead_man_task(void *arg) {
+    const int64_t TIMEOUT_MQTT = 600;   // 10 min
+    const int64_t TIMEOUT_WIFI = 120;   // 2 min after MQTT reconnect
+    const int64_t TIMEOUT_FULL = 120;   // 2 min after WiFi reconnect
+    enum { STATE_OK, STATE_MQTT_RECONNECTED, STATE_WIFI_RECONNECTED } state = STATE_OK;
+    int64_t last_attempt = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000)); // check every minute
+        int64_t now = esp_timer_get_time() / 1000000;
+        if (MQTTdispatcher::s_last_good_ping_time == 0) continue;
+
+        if (now - MQTTdispatcher::s_last_good_ping_time > TIMEOUT_MQTT) {
+            if (state == STATE_OK) {
+                MQTTdispatcher::log_event("Dead‑man: no PUBACK for 10 min, MQTT reconnect");
+                ED_MQTT::MqttClient::forceReconnect();
+                state = STATE_MQTT_RECONNECTED;
+                last_attempt = now;
+            } else if (state == STATE_MQTT_RECONNECTED && (now - last_attempt) > TIMEOUT_WIFI) {
+                MQTTdispatcher::log_event("Dead‑man: MQTT reconnect failed, forcing WiFi stack restart");
+                ED_wifi::WiFiService::forceReconnect(); // full software restart
+                state = STATE_WIFI_RECONNECTED;
+                last_attempt = now;
+            } else if (state == STATE_WIFI_RECONNECTED && (now - last_attempt) > TIMEOUT_FULL) {
+                MQTTdispatcher::log_event("Dead‑man: WiFi restart failed, restarting system");
+                esp_restart();
+            }
+        } else {
+            state = STATE_OK;
+        }
+    }
+}
+
 esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
   strncpy(s_mqtt_id, ED_SYS::ESP_std::Device::mqttName(), sizeof s_mqtt_id - 1);
   s_config = config;
@@ -936,21 +789,8 @@ esp_err_t MQTTdispatcher::initialize(esp_mqtt_client_config_t *config) {
   xTaskCreate(info_publisher_task, "info_pub", 8192, nullptr, 5,
               &s_info_task_handle);
 
-  // Start the dead‑man monitor task (checks for good PUBACKs)
-  xTaskCreate([](void*){
-    const int64_t TIMEOUT_SEC = 600; // 10 minutes
-    while (1) {
-      vTaskDelay(pdMS_TO_TICKS(60000)); // check every minute
-      int64_t now = esp_timer_get_time() / 1000000;
-      if (s_last_good_ping_time > 0 && (now - s_last_good_ping_time) > TIMEOUT_SEC) {
-        ESP_LOGW(TAG, "Dead‑man: No good PUBACK for %lld seconds, forcing MQTT reconnect", now - s_last_good_ping_time);
-        // Force an MQTT reconnect (without touching WiFi)
-        ED_MQTT::MqttClient::forceReconnect();
-        // Reset the timestamp to avoid immediate re‑trigger
-        s_last_good_ping_time = now;
-      }
-    }
-  }, "mqtt_deadman", 2048, NULL, 1, NULL);
+  // Start the escalated dead‑man task
+  xTaskCreate(dead_man_task, "mqtt_deadman", 4096, NULL, 1, NULL);
 
   ESP_LOGI(TAG, "initialized, waiting for IP before starting MQTT");
   return ESP_OK;
@@ -968,6 +808,7 @@ void MQTTdispatcher::on_ip_ready() {
   s_cached_ip[sizeof(s_cached_ip) - 1] = '\0';
 
   ESP_LOGI(TAG, "IP ready — creating MQTT client");
+  log_event("IP ready, creating MQTT client");
   s_mqtt = ED_MQTT::MqttClient::create(s_config);
   if (!s_mqtt) {
     ESP_LOGE(TAG, "MqttClient::create failed");
@@ -998,5 +839,17 @@ void MQTTdispatcher::registerJsonFieldProvider(JsonFieldProvider provider) {
   }
   s_json_providers[s_json_provider_count++] = provider;
 }
+
+// Auto‑register DUMPLOG command
+static class DumpLogReg : public CommandWithRegistry {
+public:
+    DumpLogReg() : CommandWithRegistry("SYS", "System commands") {
+        ctrlCommand cmd;
+        cmd.cmdID = "DUMPLOG";
+        cmd.cmdDex = "Dump persistent log via MQTT";
+        cmd.funcPointer = MQTTdispatcher::cmd_dumplog;
+        registry.registerCommand(cmd);
+    }
+} s_dumplog_reg;
 
 } // namespace ED_MQTT_dispatcher

@@ -4,6 +4,7 @@
 #include "mqtt_client.h"
 #include "ED_MQTT.h"
 #include "ED_S_JSON.h"
+#include <cstdarg>
 
 namespace ED_MQTT_dispatcher {
 
@@ -127,6 +128,17 @@ public:
     static void registerPingFailureCallback(PingFailureCallback cb);
     static void resetMqttReconnectAttempts();
 
+    // Dump persistent log (RTC memory) via MQTT
+    static void cmd_dumplog(ctrlCommand* cmd);
+
+    // Persistent logging (public for dead‑man task)
+    static char s_log_buffer[2048];
+    static uint16_t s_log_pos;
+    static void log_event(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+    // Dead‑man monitor timestamp (public for dead‑man task)
+    static int64_t s_last_good_ping_time;
+
 private:
     static bool s_reconnect_pending;
     static void on_ip_ready();
@@ -172,9 +184,6 @@ private:
     static int64_t s_last_wifi_reconnect_time;
     static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
     static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300; // 5 minutes
-
-    // Dead‑man monitor (good PUBACK)
-    static int64_t s_last_good_ping_time;
 };
 
 } // namespace ED_MQTT_dispatcher
