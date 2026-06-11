@@ -4,10 +4,8 @@
 #include "mqtt_client.h"
 #include "ED_MQTT.h"
 #include "ED_S_JSON.h"
-#include <cstdint>
 
 // Enable compact persistent logging (RTC memory, no NVS wear)
-// Comment out to disable persistent logging and DUMPLOG command
 #define ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG
 
 namespace ED_MQTT_dispatcher {
@@ -153,7 +151,8 @@ public:
         THRESHOLD_REACHED = 13,
         TOO_MANY_MISSED = 14,
         INFO_PING_SKIPPED = 15,
-        RECONNECT_ATTEMPT = 16
+        RECONNECT_ATTEMPT = 16,
+        SOFT_REBOOT = 17
     };
 
     static void log_event(EventCode code);
@@ -205,13 +204,6 @@ private:
     static int64_t s_last_wifi_reconnect_time;
     static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
     static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300; // 5 minutes
-
-#ifdef ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG
-    // Compact log buffer (RTC memory, 3 bytes per event)
-    static RTC_DATA_ATTR uint8_t s_log_buffer[2046]; // 682 * 3
-    static RTC_DATA_ATTR uint16_t s_log_count;       // number of stored events
-    static RTC_DATA_ATTR uint32_t s_log_first_time;  // absolute ms of first event
-#endif
 };
 
 } // namespace ED_MQTT_dispatcher

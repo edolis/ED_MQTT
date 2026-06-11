@@ -1,25 +1,41 @@
 # ED_MQTT Dispatcher – Complete Documentation
 
-The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher and health monitor for ESP‑IDF. It integrates with `ED_MQTT::MqttClient`, parses incoming messages (colon commands or JSON), routes them to registered handlers, and includes a **multi‑layer recovery system** with **compact persistent logging** (RTC memory) that survives software reboots. A built‑in `DUMPLOG` command allows remote retrieval of the event log for debugging.
+The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher and health monitor for ESP‑IDF. It integrates with `ED_MQTT::MqttClient`, parses incoming messages (colon commands or JSON), routes them to registered handlers, and includes a **multi‑layer recovery system** with **compact persistent logging** (RTC memory) that survives software reboots. Built‑in commands `DUMPLOG` and `RESTART` allow remote debugging and recovery, including device‑specific targeting.
 
 ## Table of Contents
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Command Processing](#command-processing)
-- [Health Monitor & Ping Callbacks](#health-monitor--ping-callbacks)
-- [Multi‑Level Recovery (MQTT → WiFi)](#multi‑level-recovery-mqtt--wifi)
-- [Dead‑Man Monitor & Escalation](#dead‑man-monitor--escalation)
-- [Persistent Logging & DUMPLOG Command](#persistent-logging--dumplog-command)
-  - [Compact Delta Log Format](#compact-delta-log-format)
-  - [Event Codes](#event-codes)
-  - [Retrieving the Log](#retrieving-the-log)
-  - [Example Output](#example-output)
-- [API Reference](#api-reference)
-- [Usage Examples](#usage-examples)
-- [Command Syntax](#command-syntax)
-- [PFREQ Command](#pfreq-command)
-- [Dependencies](#dependencies)
-- [Troubleshooting](#troubleshooting)
+- [ED\_MQTT Dispatcher – Complete Documentation](#ed_mqtt-dispatcher--complete-documentation)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Architecture](#architecture)
+  - [Command Processing](#command-processing)
+    - [Colon Command Flow](#colon-command-flow)
+    - [JSON Command Flow](#json-command-flow)
+  - [Health Monitor \& Ping Callbacks](#health-monitor--ping-callbacks)
+  - [Multi‑Level Recovery (MQTT → WiFi)](#multilevel-recovery-mqtt--wifi)
+  - [Dead‑Man Monitor \& Escalation](#deadman-monitor--escalation)
+  - [Persistent Logging \& DUMPLOG Command](#persistent-logging--dumplog-command)
+    - [Delta‑Based Circular Log Format](#deltabased-circular-log-format)
+    - [Event Codes](#event-codes)
+    - [Retrieving the Log](#retrieving-the-log)
+    - [Example Output](#example-output)
+  - [Soft Restart \& Device‑Specific Commands](#soft-restart--devicespecific-commands)
+    - [Command Usage](#command-usage)
+    - [Behaviour](#behaviour)
+    - [Examples](#examples)
+    - [Device‑Specific Any Command](#devicespecific-any-command)
+  - [API Reference](#api-reference)
+    - [MQTTdispatcher](#mqttdispatcher)
+  - [Usage Examples](#usage-examples)
+    - [Basic Setup](#basic-setup)
+    - [Registering Commands](#registering-commands)
+    - [Handling Ping Events (LED feedback)](#handling-ping-events-led-feedback)
+  - [Command Syntax](#command-syntax)
+    - [Colon Commands](#colon-commands)
+    - [JSON Commands](#json-commands)
+  - [PFREQ Command](#pfreq-command)
+  - [Dependencies](#dependencies)
+  - [Troubleshooting](#troubleshooting)
+  - [Summary](#summary)
 
 ---
 
@@ -27,12 +43,13 @@ The **ED_MQTT Dispatcher** is a lightweight, zero‑heap MQTT command dispatcher
 
 The dispatcher provides:
 
-1. **Command dispatch** – listens on MQTT topic `"cmd"`, parses colon commands (`:COMMAND ...`) or JSON objects, and routes them to registered `iCommandRunner` subscribers or `CommandRegistry` entries.
+1. **Command dispatch** – listens on MQTT topics `"cmd"` (general) and `"cmd/<device_id>"` (device‑specific). Parses colon commands (`:COMMAND ...`) or JSON objects, and routes them to registered `iCommandRunner` subscribers or `CommandRegistry` entries.
 2. **Periodic device diagnostics** – every N seconds (default 10, adjustable via `PFREQ`) publishes a JSON object to `devices/<id>/diag` containing uptime, IP, and custom fields.
 3. **Health monitoring** – the diagnostic message is published with QoS 1. If two consecutive PUBACKs are missed, it forces an MQTT reconnect.
 4. **Multi‑level recovery** – tracks MQTT reconnect attempts. After 6 attempts, triggers a WiFi reset (once every 5 min).
 5. **Dead‑man monitor** – a separate task checks every minute for the last successful PUBACK. Escalation: 10 min → MQTT reconnect; 12 min → WiFi stack restart; 14 min → system restart. All steps are logged.
-6. **Persistent logging** – a compact circular buffer in RTC memory stores key events (3 bytes per event). The log survives `esp_restart()` (but not power cycles). The `DUMPLOG` command publishes the log remotely.
+6. **Persistent logging** – a compact circular buffer in RTC memory stores key events (3 bytes per event). The log survives `esp_restart()` (soft reboot) but not power cycles. The `DUMPLOG` command publishes the log in multiple MQTT messages with page headers.
+7. **Soft restart & device‑specific commands** – the `RESTART` command (sent to `cmd` or `cmd/<device_id>`) triggers a soft reboot (`esp_restart()`). Any colon command can be targeted to a single device by publishing to `cmd/<device_id>`.
 
 All components use static allocation – no `std::function`, no dynamic memory after initialisation.
 
@@ -82,7 +99,7 @@ flowchart TD
         LOG[Persistent Log<br>RTC memory]
     end
 
-    B -- "subscribe to 'cmd'" --> DISP
+    B -- "subscribe to 'cmd' and 'cmd/+'" --> DISP
     DISP -- "publish diag (QoS1)" --> B
     B -- "PUBACK" --> DISP
 
@@ -112,13 +129,18 @@ flowchart TD
     DISP -. "ping callbacks" .-> LED
     DISP -. "log_event" .-> LOG
     LOG -. "DUMPLOG command" .-> DISP
+    DISP -. "RESTART command" .-> esp_restart
 ```
 
 ---
 
 ## Command Processing
 
-The dispatcher processes messages from the MQTT topic `"cmd"` in two formats: **colon commands** (starting with `:`) and **JSON** (single object or array).
+The dispatcher processes messages from two MQTT topics:
+- `"cmd"` – general commands (processed by all devices subscribing to this topic).
+- `"cmd/<device_id>"` – device‑specific commands (only the device with matching ID processes them). The device ID is the MQTT client ID set in the configuration (typically `ED_SYS::ESP_std::Device::mqttName()`).
+
+The message format can be **colon commands** (starting with `:`) or **JSON** (single object or array).
 
 ### Colon Command Flow
 
@@ -179,17 +201,21 @@ Each step is logged to the persistent log (and console). This guarantees the dev
 
 ## Persistent Logging & DUMPLOG Command
 
-The dispatcher maintains a **compact circular log buffer** in RTC memory. RTC memory is **internal SRAM** that survives software reboots (e.g., `esp_restart()`) but not power cycles. This means after a deliberate system restart (last resort), you can still retrieve the events that led to the restart.
+The dispatcher maintains a **compact delta‑based circular log buffer** in RTC memory. RTC memory is **internal SRAM** that survives software reboots (e.g., `esp_restart()`) but not power cycles. This means after a deliberate system restart (last resort), you can still retrieve the events that led to the restart.
 
 The log is enabled by default (`ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG` macro). To disable it, comment out the `#define` at the top of the header.
 
-### Compact Delta Log Format
+### Delta‑Based Circular Log Format
 
 - **Buffer size**: 2046 bytes (RTC memory).
 - **Entry size**: 3 bytes = 1 byte event code + 2 bytes delta (milliseconds since previous event).
 - **Maximum entries**: 682 events.
-- **Base timestamp**: absolute milliseconds since boot of the first logged event (stored separately).
-- **Wrapping**: When the buffer is full, new events are **discarded** (no overwrite) to preserve the oldest events leading to a failure. For most failure scenarios, 682 events are sufficient.
+- **Base timestamp**: absolute milliseconds (since boot) of the oldest event stored separately.
+- **Wrapping**: When the buffer is full, the oldest event is overwritten, and the base time is advanced by the delta of the removed event. The log always contains the most recent 682 events.
+
+When you send `:DUMPLOG`, the dispatcher reconstructs absolute timestamps by starting from the stored base time and adding each delta sequentially. Because the buffer may be full, the header shows the absolute uptime of the oldest event in the buffer, allowing you to correlate with the `d_UPT` field in the diagnostic JSON.
+
+The buffer is stored using the `__attribute__((section(".rtc_noinit")))` attribute, which ensures it is not cleared on soft reboot (called by `esp_restart()`). A magic number is used to detect first boot or corruption.
 
 ### Event Codes
 
@@ -213,42 +239,93 @@ Each event is represented by a single byte code. The following codes are logged:
 | 14 | `TOO_MANY_MISSED` | Two consecutive missed PUBACKs |
 | 15 | `INFO_PING_SKIPPED` | Publish skipped because MQTT not ready |
 | 16 | `RECONNECT_ATTEMPT` | MQTT reconnect attempt count incremented |
+| 17 | `SOFT_REBOOT` | Soft reboot triggered by `RESTART` command |
 
 These codes allow full reconstruction of the sequence of events leading to a failure.
 
 ### Retrieving the Log
 
-Send the command `:DUMPLOG` to the MQTT topic `"cmd"`. The dispatcher will respond by publishing the log (as plain text) to the topic:
+Send the command `:DUMPLOG` to the MQTT topic `"cmd"` (or `cmd/<device_id>` for a specific device). The dispatcher responds by publishing the log in **multiple messages** (each up to ~1400 bytes) to topics:
 
-    devices/<your_device_id>/dumplog
+    devices/<your_device_id>/dumplog/1
+    devices/<your_device_id>/dumplog/2
+    ...
 
-For example, using `mosquitto_pub`:
+The first message contains a header with the total number of events and the absolute uptime of the oldest event. Subsequent messages start with a simple page header `=== Page X ===`. Each message contains up to about 70 lines of events.
+
+Subscribe to the base topic `devices/<your_device_id>/dumplog/#` to receive all parts.
+
+**Example using `mosquitto_pub` and `mosquitto_sub`:**
 
     mosquitto_pub -t "cmd" -m ":DUMPLOG" -h <broker_ip>
-
-Then subscribe to the response:
-
-    mosquitto_sub -t "devices/ESP_32:97:54/dumplog" -h <broker_ip>
-
-The log output shows each event with a relative timestamp (seconds.milliseconds) from the first logged event.
+    mosquitto_sub -t "devices/ESP_32:97:54/dumplog/#" -h <broker_ip>
 
 ### Example Output
 
+**First message:**
+
+    === 120 events (oldest at 1234.567 sec uptime) ===
     [  0.000] IP ready
-    [  1.234] MQTT connected
-    [ 11.456] Ping sent
-    [ 11.789] PUBACK
-    [ 21.456] Ping sent
-    [ 31.456] Missing PUBACK
-    [ 31.456] Too many missed
-    [ 31.456] Force reconnect
-    [ 31.456] Reconnect attempt
-    [ 33.567] MQTT connected
-    [ 43.567] Ping sent
+    [  0.034] MQTT connected
+    [ 10.000] Ping sent
+    [ 10.023] PUBACK
+    [ 20.000] Ping sent
+    [ 20.018] PUBACK
+    ... (more lines)
+
+**Second message (if needed):**
+
+    === Page 2 ===
+    [ 120.000] Missing PUBACK
+    [ 120.000] Too many missed
+    [ 120.000] Force reconnect
+    [ 120.000] Reconnect attempt
+    [ 122.000] MQTT connected
+    ...
 
 If the ESP later restarts due to the dead‑man (code 11), the log will still be present in RTC memory. After reboot, you can send `:DUMPLOG` again and see the events from before the restart (the log is not cleared on software reboot). This gives you a complete breadcrumb trail.
 
 **Note:** Power cycling the ESP (removing power) will erase the log, as RTC memory loses content. For debugging, keep the device powered.
+
+---
+
+## Soft Restart & Device‑Specific Commands
+
+The dispatcher provides a built‑in command `RESTART` that performs a soft reboot of the ESP32. This is useful for remote recovery when the device is unresponsive but still reachable via MQTT.
+
+### Command Usage
+
+`RESTART` can be sent in two ways:
+- **General command** – publish to the main topic `"cmd"`. Any device subscribed to `cmd` will reboot.
+- **Device‑specific command** – publish to `cmd/<device_id>`, where `<device_id>` is the device’s MQTT client ID (e.g., `cmd/ESP_32:97:54`). Only the device with that ID will reboot. This allows targeted reboots without affecting other devices.
+
+### Behaviour
+
+The device will:
+- Log a `SOFT_REBOOT` event (code 17) to the persistent log.
+- Send an acknowledgment to `ack/<device_id>` with the message "Rebooting...".
+- Wait 1 second to allow the acknowledgment to be sent.
+- Call `esp_restart()`.
+
+All MQTT state is lost, but the persistent log in RTC memory **survives** the restart. After reboot, you can send `:DUMPLOG` to see the events leading up to the restart.
+
+### Examples
+
+**General restart (all devices):**
+
+    mosquitto_pub -t "cmd" -m ":RESTART" -h <broker_ip>
+
+**Device‑specific restart:**
+
+    mosquitto_pub -t "cmd/ESP_32:97:54" -m ":RESTART" -h <broker_ip>
+
+The acknowledgment will appear on `ack/ESP_32:97:54`.
+
+### Device‑Specific Any Command
+
+The dispatcher supports sending **any colon command** (not only `RESTART`) to the device‑specific topic `cmd/<device_id>`. For example, you can send `:FWUP v2.1.0` to `cmd/ESP_32:97:54` to update only that device.
+
+This is achieved by subscribing to `cmd/+` and filtering by the topic suffix. No additional configuration is needed.
 
 ---
 
@@ -358,6 +435,8 @@ ED_MQTT_dispatcher::MQTTdispatcher::registerPingFailureCallback(on_ping_failure)
     :PFREQ 30s
     :BLINK -rate_ms 200 -color blue
     :HELP OTA
+    :DUMPLOG
+    :RESTART
 
 Special auto‑injected parameters: `_msgID`, `_original`, `_default`.
 
@@ -412,12 +491,16 @@ idf_component_register(SRCS "ED_MQTT_dispatcher.cpp"
 | LED stays red after broker restart | Missing PUBACK (reason code 16) | Check broker ACL and MQTT5 user properties. |
 | No pings sent | Info timer not started | Ensure `on_mqtt_connected` was called (check log). |
 | Dead‑man restarts system repeatedly | WiFi stack cannot connect | Check WiFi credentials, signal strength, DHCP. |
-| `DUMPLOG` returns nothing | Log buffer empty or MQTT down | Wait for at least one event, or read console on reboot. |
-| Log shows only a few events | Buffer may be full | Events after buffer full are dropped; increase buffer size if needed. |
+| `DUMPLOG` returns no messages | Log buffer empty or MQTT down | Wait for at least one event, or read console on reboot. |
+| Log shows only a few events | Buffer may be full, oldest events overwritten | This is expected – the log always shows the most recent 682 events. |
+| Multiple log parts not received | MQTT client subscription not matching wildcard | Subscribe to `devices/<id>/dumplog/#`. |
+| `RESTART` command does nothing | Command not enabled (macro may be disabled) | Ensure `ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG` is defined (required for built‑in commands). |
+| Device‑specific command ignored | Wrong device ID | Verify the client ID matches exactly (case‑sensitive). |
+| Log not surviving soft reboot | RTC memory not preserved on this board | Use the `__attribute__((section(".rtc_noinit")))` as in the provided code; if still fails, consult hardware documentation. |
 
 ---
 
 ## Summary
 
-The dispatcher combines three independent recovery layers (fast MQTT reconnect, slower WiFi reset, dead‑man escalation) with a **compact persistent log** (RTC memory) that survives software reboots. The `DUMPLOG` command lets you retrieve the log remotely, providing full visibility into the sequence of events leading to a failure. This makes the device truly self‑healing and debuggable without physical access.
+The dispatcher combines three independent recovery layers (fast MQTT reconnect, slower WiFi reset, dead‑man escalation) with a **compact delta‑based persistent log** (RTC memory, 3 bytes per event, 682 events). The `DUMPLOG` command splits the log into multiple MQTT messages with clear page headers for easy viewing. The `RESTART` command enables remote soft reboot, supporting both general and device‑specific targeting. The log survives soft reboots, giving full visibility into failures. This makes the device truly self‑healing and debuggable without physical access.
 ```
