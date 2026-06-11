@@ -4,7 +4,11 @@
 #include "mqtt_client.h"
 #include "ED_MQTT.h"
 #include "ED_S_JSON.h"
-#include <cstdarg>
+#include <cstdint>
+
+// Enable compact persistent logging (RTC memory, no NVS wear)
+// Comment out to disable persistent logging and DUMPLOG command
+#define ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG
 
 namespace ED_MQTT_dispatcher {
 
@@ -128,16 +132,33 @@ public:
     static void registerPingFailureCallback(PingFailureCallback cb);
     static void resetMqttReconnectAttempts();
 
-    // Dump persistent log (RTC memory) via MQTT
-    static void cmd_dumplog(ctrlCommand* cmd);
-
-    // Persistent logging (public for dead‑man task)
-    static char s_log_buffer[2048];
-    static uint16_t s_log_pos;
-    static void log_event(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-
-    // Dead‑man monitor timestamp (public for dead‑man task)
+    // Dead‑man monitor timestamp (public for dead_man_task)
     static int64_t s_last_good_ping_time;
+
+#ifdef ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG
+    // Compact delta logging (3 bytes per event)
+    enum class EventCode : uint8_t {
+        IP_READY = 1,
+        MQTT_CONNECTED = 2,
+        MQTT_DISCONNECTED = 3,
+        INFO_PING_SENT = 4,
+        PUBACK_RECEIVED = 5,
+        MISSING_PUBACK = 6,
+        FORCE_RECONNECT = 7,
+        WIFI_RECONNECT = 8,
+        DEAD_MAN_MQTT = 9,
+        DEAD_MAN_WIFI = 10,
+        DEAD_MAN_RESTART = 11,
+        PUBLISH_ERROR = 12,
+        THRESHOLD_REACHED = 13,
+        TOO_MANY_MISSED = 14,
+        INFO_PING_SKIPPED = 15,
+        RECONNECT_ATTEMPT = 16
+    };
+
+    static void log_event(EventCode code);
+    static void cmd_dumplog(ctrlCommand* cmd);
+#endif
 
 private:
     static bool s_reconnect_pending;
@@ -184,6 +205,13 @@ private:
     static int64_t s_last_wifi_reconnect_time;
     static constexpr uint8_t MQTT_RECONNECT_THRESHOLD = 6;
     static constexpr int64_t WIFI_RECONNECT_COOLDOWN_SEC = 300; // 5 minutes
+
+#ifdef ED_MQTT_DISPATCHER_ENABLE_PERSISTENT_LOG
+    // Compact log buffer (RTC memory, 3 bytes per event)
+    static RTC_DATA_ATTR uint8_t s_log_buffer[2046]; // 682 * 3
+    static RTC_DATA_ATTR uint16_t s_log_count;       // number of stored events
+    static RTC_DATA_ATTR uint32_t s_log_first_time;  // absolute ms of first event
+#endif
 };
 
 } // namespace ED_MQTT_dispatcher
